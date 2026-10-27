@@ -18,6 +18,29 @@ pub enum Security {
     StartTls,
 }
 
+/// One of a small, fixed set of preset colors a tab can be assigned —
+/// deliberately a minimal picker, not a full color wheel (see
+/// `candor_group7_multiaccount_plan` in memory). The actual hex/CSS
+/// mapping for each preset belongs to `candor-gui`, not here — this
+/// crate just stores which one was chosen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TabColor {
+    Blue,
+    Green,
+    Purple,
+    Orange,
+    Red,
+    Teal,
+    Pink,
+    Yellow,
+}
+
+impl Default for TabColor {
+    fn default() -> Self {
+        TabColor::Blue
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AccountConfig {
     /// Local identifier used as the keyring lookup key, e.g. "personal".
@@ -32,6 +55,54 @@ pub struct AccountConfig {
     pub smtp_security: Security,
     /// Login identity for IMAP/SMTP auth, often the same as `email`.
     pub username: String,
+    /// Whether this account's tab can send mail right now — new
+    /// compose, reply, reply-all, and forward alike. Defaults to
+    /// `true` (locked) for a newly-added account: starting locked
+    /// doubles as organic onboarding for a safety feature a new user
+    /// might otherwise never discover. Only ever flipped by an
+    /// explicit user click on the lock control — never by the app
+    /// itself, never on a timer, never any other automatic condition.
+    /// Enforced in two places at once: the Send control is disabled/
+    /// unfocusable in the GUI, *and* the daemon's own `send_message`
+    /// handler refuses to send while this is `true`, so there's no
+    /// path that bypasses it by only disabling one button. See
+    /// `candor_group7_multiaccount_plan` in memory.
+    #[serde(default = "default_locked")]
+    pub locked: bool,
+    /// Fixed tab position, assigned when the account is added and
+    /// changed only through an explicit Settings action — never by
+    /// live drag-reordering. Reordering live risks silently swapping
+    /// which account is which mid-use, which defeats the entire point
+    /// of a fixed position (instant recognition without having to
+    /// think about which tab is which).
+    #[serde(default)]
+    pub tab_order: u32,
+    /// One of `TabColor`'s small preset set, shown on this account's
+    /// tab as one of the two primary "which account am I in" signals
+    /// (alongside `tab_order`'s fixed position).
+    #[serde(default)]
+    pub color: TabColor,
+    /// Short label shown on the tab for fast visual scanning —
+    /// alphanumeric characters only, capped at 13 characters (the
+    /// length of "entertainment"). Empty means none has been set yet;
+    /// the GUI falls back to showing something else (e.g. the display
+    /// name) in that case. Validation of the alphanumeric-only/length
+    /// rule belongs to whatever sets this (the GUI's settings form),
+    /// not this struct.
+    #[serde(default)]
+    pub short_name: String,
+    /// Whether this is the account Candor opens to on launch,
+    /// regardless of whatever tab was focused when it was last
+    /// closed — deliberately not "restore last session." Exactly one
+    /// account should have this set at a time; a caller with none set
+    /// (e.g. right after the first account is ever added) should fall
+    /// back to the lowest `tab_order`.
+    #[serde(default)]
+    pub is_default: bool,
+}
+
+fn default_locked() -> bool {
+    true
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]

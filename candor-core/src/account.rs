@@ -3,10 +3,10 @@
 //! credentials, and only then persist anything. A password that fails
 //! verification is never written to the keyring or to disk.
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use zeroize::Zeroizing;
 
-use crate::config::{self, AccountConfig, CredentialStore, Security};
+use crate::config::{self, AccountConfig, CredentialStore, Security, TabColor};
 use crate::connect;
 use crate::discover::{self, Discovery, ServerSettings};
 
@@ -82,8 +82,28 @@ pub async fn add_account(req: NewAccountRequest) -> Result<AddAccountOutcome> {
 
     let id = slugify(&req.email);
 
+    let mut app_config = config::load().context("loading existing config")?;
+    if app_config.accounts.iter().any(|a| a.id == id) {
+        // Same email added twice would otherwise produce two
+        // `AccountConfig` entries sharing one `id` — breaking every
+        // assumption the keyring and the local SQLite index make
+        // about `account_id` being a unique key. Rejected here,
+        // before anything is written, rather than left to surface
+        // confusingly later.
+        bail!("an account for {} is already configured", id);
+    }
+
     CredentialStore::set_password(&id, &req.password)
         .context("storing credential in the OS keyring")?;
+
+    // The very first account ever added starts as the default tab —
+    // there's nothing else for that to mean yet. Later accounts stay
+    // non-default until the user explicitly changes it in Settings.
+    // Tab order appends to the end, in whatever order accounts were
+    // added — also only ever changed afterward through Settings, not
+    // automatically.
+    let is_default = app_config.accounts.is_empty();
+    let tab_order = app_config.accounts.len() as u32;
 
     let account = AccountConfig {
         id,
@@ -96,36 +116,41 @@ pub async fn add_account(req: NewAccountRequest) -> Result<AddAccountOutcome> {
         smtp_port: settings.smtp_port,
         smtp_security: settings.smtp_security,
         username: req.username,
+        // Locked by default — see `AccountConfig::locked`'s doc
+        // comment for why.
+        locked: true,
+        tab_order,
+        color: default_color_for(tab_order),
+        short_name: String::new(),
+        is_default,
     };
 
-    let mut app_config = config::load().context("loading existing config")?;
-    app_config.accounts.clear(); // v1: single account only.
     app_config.accounts.push(account.clone());
     config::save(&app_config).context("saving account config")?;
 
     Ok(AddAccountOutcome::Added(account))
 }
 
-/// Returns `(id, email, display_name)` for the configured account, if any.
-/// `id` is the key used for both the keyring entry and the local message
-/// index (SQLite), so the GUI needs it to query synced data directly.
-pub fn account_summary() -> Result<Option<(String, String, String)>> {
+/// Every configured account, in whatever order they're stored in —
+/// callers that care about tab order sort by `tab_order` themselves.
+/// `id` is the key used for both the keyring entry and the local
+/// message index (SQLite).
+pub fn list_accounts() -> Result<Vec<AccountConfig>> {
     let cfg = config::load().context("loading config")?;
-    Ok(cfg
-        .accounts
-        .first()
-        .map(|a| (a.id.clone(), a.email.clone(), a.display_name.clone())))
+    Ok(cfg.accounts)
 }
 
-/// Deletes the configured account's credential from the keyring and clears
-/// it from the config file. Returns `false` if there was no account to
-/// remove. The keyring deletion is best-effort: a failure there (e.g. the
-/// entry was already gone) does not block clearing the config.
-pub fn remove_account() -> Result<bool> {
+/// Deletes one account's credential from the keyring and removes it
+/// from the config file. Returns `false` if no account with that id
+/// was configured. The keyring deletion is best-effort: a failure
+/// there (e.g. the entry was already gone) does not block clearing
+/// the config.
+pub fn remove_account(account_id: &str) -> Result<bool> {
     let mut cfg = config::load().context("loading config")?;
-    let Some(account) = cfg.accounts.pop() else {
+    let Some(index) = cfg.accounts.iter().position(|a| a.id == account_id) else {
         return Ok(false);
     };
+    let account = cfg.accounts.remove(index);
 
     if let Err(e) = CredentialStore::delete_password(&account.id) {
         tracing::warn!(error = %e, account = %account.id, "failed to delete credential from keyring");
@@ -146,4 +171,24 @@ fn slugify(email: &str) -> String {
             }
         })
         .collect()
+}
+
+/// A starting color for a newly-added account — just rotates through
+/// `TabColor`'s preset set by position, so accounts added one after
+/// another default to visually distinct colors rather than all
+/// starting the same shade. Purely a starting point: the user can
+/// change it any time, this only picks what a brand-new account opens
+/// with.
+fn default_color_for(tab_order: u32) -> TabColor {
+    const PALETTE: [TabColor; 8] = [
+        TabColor::Blue,
+        TabColor::Green,
+        TabColor::Purple,
+        TabColor::Orange,
+        TabColor::Red,
+        TabColor::Teal,
+        TabColor::Pink,
+        TabColor::Yellow,
+    ];
+    PALETTE[tab_order as usize % PALETTE.len()]
 }

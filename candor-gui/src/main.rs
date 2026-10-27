@@ -2062,13 +2062,14 @@ impl AppModel {
         let Some(folder) = self.selected_folder.clone() else {
             return;
         };
+        let account_id = self.current_account_id();
         self.status = "Loading message…".to_string();
 
         let path = {
             let result = async {
                 let conn = zbus::Connection::session().await?;
                 let proxy = DaemonProxy::new(&conn).await?;
-                proxy.fetch_body(&folder, uid).await
+                proxy.fetch_body(&account_id, &folder, uid).await
             }
             .await;
 
@@ -2203,9 +2204,9 @@ impl AppModel {
         // eventually.
         if let Ok(conn) = zbus::Connection::session().await {
             if let Ok(proxy) = DaemonProxy::new(&conn).await {
-                let _ = proxy.mark_read(&reading_folder, uid).await;
+                let _ = proxy.mark_read(&account_id, &reading_folder, uid).await;
                 if let Some(text) = body_for_cache {
-                    let _ = proxy.cache_opened_body(&reading_folder, uid, &text).await;
+                    let _ = proxy.cache_opened_body(&account_id, &reading_folder, uid, &text).await;
                 }
             }
         }
@@ -2338,15 +2339,18 @@ impl AppModel {
         // (only an actual send is), so there's no continuity to lose.
         let message_id =
             candor_core::send::generate_message_id(self.configured_email.as_deref().unwrap_or(""));
+        let account_id = self.current_account_id();
 
         if has_content {
             self.status = "Saving draft…".to_string();
+            let move_account_id = account_id.clone();
             glib::spawn_future_local(async move {
                 let result = async {
                     let conn = zbus::Connection::session().await?;
                     let proxy = DaemonProxy::new(&conn).await?;
                     proxy
                         .save_draft(
+                            &account_id,
                             &compose.to,
                             &compose.subject,
                             &body,
@@ -2370,7 +2374,7 @@ impl AppModel {
                 if let Some((folder, uid)) = compose.editing_draft {
                     if let Ok(conn) = zbus::Connection::session().await {
                         if let Ok(proxy) = DaemonProxy::new(&conn).await {
-                            let _ = proxy.move_message(&folder, uid, "\\Trash").await;
+                            let _ = proxy.move_message(&move_account_id, &folder, uid, "\\Trash").await;
                         }
                     }
                 }
@@ -2388,7 +2392,7 @@ impl AppModel {
                 glib::spawn_future_local(async move {
                     if let Ok(conn) = zbus::Connection::session().await {
                         if let Ok(proxy) = DaemonProxy::new(&conn).await {
-                            let _ = proxy.move_message(&folder, uid, "\\Trash").await;
+                            let _ = proxy.move_message(&account_id, &folder, uid, "\\Trash").await;
                         }
                     }
                     let _ = input_sender.send(Msg::Refresh);
@@ -2406,13 +2410,14 @@ impl AppModel {
         let Some(folder) = self.selected_folder.clone() else {
             return;
         };
+        let account_id = self.current_account_id();
         self.status = "Loading draft…".to_string();
 
         let path = {
             let result = async {
                 let conn = zbus::Connection::session().await?;
                 let proxy = DaemonProxy::new(&conn).await?;
-                proxy.fetch_body(&folder, uid).await
+                proxy.fetch_body(&account_id, &folder, uid).await
             }
             .await;
 
@@ -2659,10 +2664,11 @@ impl AppModel {
         };
 
         self.status = "Importing contacts…".to_string();
+        let account_id = self.current_account_id();
         let result = async {
             let conn = zbus::Connection::session().await?;
             let proxy = DaemonProxy::new(&conn).await?;
-            proxy.import_contacts_csv(&path.display().to_string()).await
+            proxy.import_contacts_csv(&account_id, &path.display().to_string()).await
         }
         .await;
 
@@ -2716,11 +2722,12 @@ impl AppModel {
         };
 
         self.status = "Saving attachments…".to_string();
+        let account_id = self.current_account_id();
 
         let result = async {
             let conn = zbus::Connection::session().await?;
             let proxy = DaemonProxy::new(&conn).await?;
-            proxy.save_attachments(&folder, uid, &dest_dir.display().to_string()).await
+            proxy.save_attachments(&account_id, &folder, uid, &dest_dir.display().to_string()).await
         }
         .await;
 
@@ -2729,6 +2736,18 @@ impl AppModel {
             Ok((false, _)) => "No account configured.".to_string(),
             Err(e) => format!("Failed to save attachments: {e}"),
         };
+    }
+
+    /// The account every D-Bus call acts on — every per-account daemon
+    /// method now takes an explicit `account_id` (Group 7's daemon-side
+    /// multi-account work), but this GUI itself is still single-account,
+    /// so every call site threads this same value through. Empty string
+    /// rather than erroring when unset (e.g. before the first account is
+    /// configured) — the daemon's own `resolve_account` rejects an empty/
+    /// unmatched id with a clear error, which every call site already
+    /// has an `Err(e) => ...` branch for.
+    fn current_account_id(&self) -> String {
+        self.account_id.clone().unwrap_or_default()
     }
 
     /// The raw IMAP folder name tagged with a given RFC 6154 SPECIAL-USE
@@ -2774,11 +2793,12 @@ impl AppModel {
         };
 
         self.status = "Moving message…".to_string();
+        let account_id = self.current_account_id();
 
         let result = async {
             let conn = zbus::Connection::session().await?;
             let proxy = DaemonProxy::new(&conn).await?;
-            proxy.move_message(folder, uid, &target).await
+            proxy.move_message(&account_id, folder, uid, &target).await
         }
         .await;
 
@@ -2828,13 +2848,14 @@ impl AppModel {
     /// enough to pick up the change; there's nothing server-side yet
     /// for a real `sync_now()` to catch up on.
     async fn set_seen_by_uid(&mut self, folder: &str, uid: u32, seen: bool) {
+        let account_id = self.current_account_id();
         let result = async {
             let conn = zbus::Connection::session().await?;
             let proxy = DaemonProxy::new(&conn).await?;
             if seen {
-                proxy.mark_read(folder, uid).await
+                proxy.mark_read(&account_id, folder, uid).await
             } else {
-                proxy.mark_unread(folder, uid).await
+                proxy.mark_unread(&account_id, folder, uid).await
             }
         }
         .await;
@@ -2849,13 +2870,14 @@ impl AppModel {
     /// Sets or clears a message's `\Flagged` (star) flag by folder+UID —
     /// same shape, and same local-only reasoning, as `set_seen_by_uid`.
     async fn set_flagged_by_uid(&mut self, folder: &str, uid: u32, flagged: bool) {
+        let account_id = self.current_account_id();
         let result = async {
             let conn = zbus::Connection::session().await?;
             let proxy = DaemonProxy::new(&conn).await?;
             if flagged {
-                proxy.mark_flagged(folder, uid).await
+                proxy.mark_flagged(&account_id, folder, uid).await
             } else {
-                proxy.mark_unflagged(folder, uid).await
+                proxy.mark_unflagged(&account_id, folder, uid).await
             }
         }
         .await;
@@ -2886,11 +2908,12 @@ impl AppModel {
         let Some(folder) = self.selected_folder.clone() else {
             return;
         };
+        let account_id = self.current_account_id();
 
         let result = async {
             let conn = zbus::Connection::session().await?;
             let proxy = DaemonProxy::new(&conn).await?;
-            proxy.schedule_message(&folder, uid, wake_at).await
+            proxy.schedule_message(&account_id, &folder, uid, wake_at).await
         }
         .await;
 
@@ -2906,10 +2929,11 @@ impl AppModel {
     /// itself rather than `self.selected_folder`, since this view
     /// spans every folder at once.
     async fn unschedule_row(&mut self, folder: &str, uid: u32) {
+        let account_id = self.current_account_id();
         let result = async {
             let conn = zbus::Connection::session().await?;
             let proxy = DaemonProxy::new(&conn).await?;
-            proxy.unschedule_message(folder, uid).await
+            proxy.unschedule_message(&account_id, folder, uid).await
         }
         .await;
 
@@ -3020,11 +3044,12 @@ impl AppModel {
             return;
         };
         let (address, name) = (reading.from.clone(), reading.from_name.clone().unwrap_or_default());
+        let account_id = self.current_account_id();
 
         let result = async {
             let conn = zbus::Connection::session().await?;
             let proxy = DaemonProxy::new(&conn).await?;
-            proxy.add_contact(&address, &name, "manual").await
+            proxy.add_contact(&account_id, &address, &name, "manual").await
         }
         .await;
 
@@ -3047,11 +3072,12 @@ impl AppModel {
         let (uid, folder) = (reading.uid, reading.folder.clone());
         self.reading = None;
         self.status = "Moving message…".to_string();
+        let account_id = self.current_account_id();
 
         let result = async {
             let conn = zbus::Connection::session().await?;
             let proxy = DaemonProxy::new(&conn).await?;
-            proxy.move_message(&folder, uid, &target).await
+            proxy.move_message(&account_id, &folder, uid, &target).await
         }
         .await;
 
@@ -3073,11 +3099,12 @@ impl AppModel {
         };
         let (uid, folder) = (reading.uid, reading.folder.clone());
         self.reading = None;
+        let account_id = self.current_account_id();
 
         let result = async {
             let conn = zbus::Connection::session().await?;
             let proxy = DaemonProxy::new(&conn).await?;
-            proxy.schedule_message(&folder, uid, wake_at).await
+            proxy.schedule_message(&account_id, &folder, uid, wake_at).await
         }
         .await;
 
@@ -3095,6 +3122,7 @@ impl AppModel {
             return;
         };
         let uids: Vec<u32> = self.selected_uids.iter().copied().collect();
+        let account_id = self.current_account_id();
 
         // One connection and one `reload()` for the whole batch, not
         // one of each per message — see `bulk_mark_toggle`'s doc
@@ -3107,7 +3135,7 @@ impl AppModel {
             let conn = zbus::Connection::session().await?;
             let proxy = DaemonProxy::new(&conn).await?;
             for &uid in &uids {
-                proxy.schedule_message(&folder, uid, wake_at).await?;
+                proxy.schedule_message(&account_id, &folder, uid, wake_at).await?;
             }
             Ok(())
         }
@@ -3754,15 +3782,16 @@ impl AppModel {
         let was_uniform = self.selected_seen_uniform().is_some();
         let target = bulk_mark_target(self);
         let uids: Vec<u32> = self.selected_uids.iter().copied().collect();
+        let account_id = self.current_account_id();
 
         let result: zbus::Result<()> = async {
             let conn = zbus::Connection::session().await?;
             let proxy = DaemonProxy::new(&conn).await?;
             for &uid in &uids {
                 if target {
-                    proxy.mark_read(&folder, uid).await?;
+                    proxy.mark_read(&account_id, &folder, uid).await?;
                 } else {
-                    proxy.mark_unread(&folder, uid).await?;
+                    proxy.mark_unread(&account_id, &folder, uid).await?;
                 }
             }
             Ok(())
@@ -3789,15 +3818,16 @@ impl AppModel {
         let was_uniform = self.selected_flagged_uniform().is_some();
         let target = bulk_flag_target(self);
         let uids: Vec<u32> = self.selected_uids.iter().copied().collect();
+        let account_id = self.current_account_id();
 
         let result: zbus::Result<()> = async {
             let conn = zbus::Connection::session().await?;
             let proxy = DaemonProxy::new(&conn).await?;
             for &uid in &uids {
                 if target {
-                    proxy.mark_flagged(&folder, uid).await?;
+                    proxy.mark_flagged(&account_id, &folder, uid).await?;
                 } else {
-                    proxy.mark_unflagged(&folder, uid).await?;
+                    proxy.mark_unflagged(&account_id, &folder, uid).await?;
                 }
             }
             Ok(())
@@ -3831,12 +3861,13 @@ impl AppModel {
             return;
         };
         let uids: Vec<u32> = self.selected_uids.iter().copied().collect();
+        let account_id = self.current_account_id();
 
         let result: zbus::Result<()> = async {
             let conn = zbus::Connection::session().await?;
             let proxy = DaemonProxy::new(&conn).await?;
             for &uid in &uids {
-                proxy.move_message(&from_folder, uid, &target).await?;
+                proxy.move_message(&account_id, &from_folder, uid, &target).await?;
             }
             Ok(())
         }
@@ -3933,12 +3964,14 @@ impl AppModel {
         // otherwise (see `OutgoingMessage::message_id`'s doc comment).
         let message_id =
             candor_core::send::generate_message_id(self.configured_email.as_deref().unwrap_or(""));
+        let account_id = self.current_account_id();
 
         let result = async {
             let conn = zbus::Connection::session().await?;
             let proxy = DaemonProxy::new(&conn).await?;
             proxy
                 .send_message(
+                    &account_id,
                     &to,
                     &subject,
                     &body,
@@ -3970,10 +4003,11 @@ impl AppModel {
                 let editing_draft = taken.and_then(|c| c.editing_draft);
                 if let Some((folder, uid)) = editing_draft {
                     let input_sender = self.input_sender.clone();
+                    let account_id = account_id.clone();
                     glib::spawn_future_local(async move {
                         if let Ok(conn) = zbus::Connection::session().await {
                             if let Ok(proxy) = DaemonProxy::new(&conn).await {
-                                let _ = proxy.move_message(&folder, uid, "\\Trash").await;
+                                let _ = proxy.move_message(&account_id, &folder, uid, "\\Trash").await;
                             }
                         }
                         let _ = input_sender.send(Msg::Refresh);
@@ -3996,12 +4030,13 @@ impl AppModel {
                 // Reply/Reply All were deliberately left out.
                 if matches!(kind, ComposeKind::New | ComposeKind::Forward) {
                     let recipients = split_recipients(&to);
+                    let account_id = account_id.clone();
                     glib::spawn_future_local(async move {
                         if let Ok(conn) = zbus::Connection::session().await {
                             if let Ok(proxy) = DaemonProxy::new(&conn).await {
                                 for (name, address) in recipients {
                                     let _ = proxy
-                                        .add_contact(&address, name.as_deref().unwrap_or(""), "sent")
+                                        .add_contact(&account_id, &address, name.as_deref().unwrap_or(""), "sent")
                                         .await;
                                 }
                             }
@@ -4017,7 +4052,7 @@ impl AppModel {
                     glib::spawn_future_local(async move {
                         if let Ok(conn) = zbus::Connection::session().await {
                             if let Ok(proxy) = DaemonProxy::new(&conn).await {
-                                let _ = proxy.cache_sent_body(&message_id, &body, now).await;
+                                let _ = proxy.cache_sent_body(&account_id, &message_id, &body, now).await;
                             }
                         }
                     });
@@ -4213,11 +4248,12 @@ impl AppModel {
         }
         let folder = (!self.search_all_folders).then(|| self.selected_folder.clone()).flatten();
         self.status = "Searching server…".to_string();
+        let account_id = self.current_account_id();
 
         let result = async {
             let conn = zbus::Connection::session().await?;
             let proxy = DaemonProxy::new(&conn).await?;
-            proxy.search_server(folder.as_deref().unwrap_or(""), &query).await
+            proxy.search_server(&account_id, folder.as_deref().unwrap_or(""), &query).await
         }
         .await;
 
@@ -4233,11 +4269,12 @@ impl AppModel {
 
     async fn sync_now(&mut self) {
         self.status = "Syncing…".to_string();
+        let account_id = self.current_account_id();
 
         let result = async {
             let conn = zbus::Connection::session().await?;
             let proxy = DaemonProxy::new(&conn).await?;
-            proxy.sync_now().await
+            proxy.sync_now(&account_id).await
         }
         .await;
 
@@ -4265,11 +4302,12 @@ impl AppModel {
         let Some(folder) = self.special_use_folder("\\Drafts") else {
             return;
         };
+        let account_id = self.current_account_id();
 
         let result = async {
             let conn = zbus::Connection::session().await?;
             let proxy = DaemonProxy::new(&conn).await?;
-            proxy.sync_folder(&folder).await
+            proxy.sync_folder(&account_id, &folder).await
         }
         .await;
 
