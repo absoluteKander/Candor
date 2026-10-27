@@ -1,0 +1,832 @@
+mod notify;
+
+use std::sync::Mutex;
+
+use candor_core::account::{self, AddAccountOutcome, ManualServerSettings, NewAccountRequest};
+use candor_core::config::{self, CredentialStore, Security};
+use candor_core::sync;
+use zbus::connection::Builder;
+use zbus::interface;
+use zeroize::Zeroizing;
+
+/// How often the background task checks for queued star/mark-read/
+/// mark-unread/archive/delete/move changes to push — see
+/// `restart_sync`'s doc comment. Nothing about this needs to be fast:
+/// the whole point of queuing these locally is that the user never
+/// waits on it.
+const PENDING_PUSH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(20);
+
+struct DaemonService {
+    /// The background IMAP IDLE sync loop for the current account, if any.
+    /// Replaced (old one aborted) on AddAccount, cleared on RemoveAccount —
+    /// otherwise a removed account would keep syncing in the background
+    /// with credentials that are no longer stored anywhere.
+    sync_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Background loop that pushes locally-queued flag changes (star,
+    /// mark-read, mark-unread) to the server on `PENDING_PUSH_INTERVAL`
+    /// — see `mark_read`/`mark_flagged`/etc. below and
+    /// `sync::push_pending_flags`'s doc comment for why these are
+    /// queued locally instead of pushed synchronously. Same
+    /// start/stop lifecycle as `sync_task`.
+    pending_push_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Drains `sync::run`'s new-mail channel and turns each batch into a
+    /// desktop notification (see `notify::send_new_mail_notification`).
+    /// Same start/stop lifecycle as the other two.
+    notify_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+}
+
+impl DaemonService {
+    fn new() -> Self {
+        Self {
+            sync_task: Mutex::new(None),
+            pending_push_task: Mutex::new(None),
+            notify_task: Mutex::new(None),
+        }
+    }
+
+    fn restart_sync(&self, account: config::AccountConfig, password: String) {
+        {
+            let (new_mail_tx, mut new_mail_rx) = tokio::sync::mpsc::unbounded_channel();
+
+            let mut guard = self.sync_task.lock().unwrap();
+            if let Some(handle) = guard.take() {
+                handle.abort();
+            }
+            *guard = Some(tokio::spawn(sync::run(account.clone(), password.clone(), new_mail_tx)));
+
+            let mut notify_guard = self.notify_task.lock().unwrap();
+            if let Some(handle) = notify_guard.take() {
+                handle.abort();
+            }
+            *notify_guard = Some(tokio::spawn(async move {
+                while let Some(mail) = new_mail_rx.recv().await {
+                    if let Err(e) = notify::send_new_mail_notification(&mail).await {
+                        tracing::warn!(error = %e, "failed to send new-mail notification");
+                    }
+                }
+            }));
+        }
+
+        let mut guard = self.pending_push_task.lock().unwrap();
+        if let Some(handle) = guard.take() {
+            handle.abort();
+        }
+        *guard = Some(tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(PENDING_PUSH_INTERVAL).await;
+                if let Err(e) = sync::push_pending_flags(account.clone(), password.clone()).await {
+                    tracing::warn!(error = %e, "failed to push queued flag changes");
+                }
+                if let Err(e) = sync::push_pending_moves(account.clone(), password.clone()).await {
+                    tracing::warn!(error = %e, "failed to push queued moves");
+                }
+                // Purely local (see `store::wake_due_snoozes`'s doc
+                // comment) — no network call, so no reason to spawn it
+                // separately from the two above.
+                match candor_core::store::open()
+                    .and_then(|db| candor_core::store::wake_due_snoozes(&db, &account.id))
+                {
+                    Ok(0) => {}
+                    Ok(n) => tracing::info!(count = n, "woke due snoozes"),
+                    Err(e) => tracing::warn!(error = %e, "failed to check due snoozes"),
+                }
+                if let Err(e) = fill_pending_body_cache(&account, &password).await {
+                    tracing::warn!(error = %e, "failed to fill pending body cache");
+                }
+                if let Err(e) = run_retention_sweep(&account.id) {
+                    tracing::warn!(error = %e, "failed to run body-cache retention sweep");
+                }
+            }
+        }));
+    }
+
+    fn stop_sync(&self) {
+        let mut guard = self.sync_task.lock().unwrap();
+        if let Some(handle) = guard.take() {
+            handle.abort();
+        }
+        let mut guard = self.pending_push_task.lock().unwrap();
+        if let Some(handle) = guard.take() {
+            handle.abort();
+        }
+        let mut guard = self.notify_task.lock().unwrap();
+        if let Some(handle) = guard.take() {
+            handle.abort();
+        }
+    }
+}
+
+#[interface(name = "dev.candor.Daemon1")]
+impl DaemonService {
+    /// Adds the (v1: single) account. Leave `manual_imap_host` empty to try
+    /// autodiscovery first; if that returns `(false, _)`, prompt the user
+    /// for server settings and call again with the manual_* fields filled
+    /// in and `added` will be true on success.
+    async fn add_account(
+        &self,
+        display_name: String,
+        email: String,
+        username: String,
+        password: String,
+        manual_imap_host: String,
+        manual_imap_port: u16,
+        manual_imap_implicit_tls: bool,
+        manual_smtp_host: String,
+        manual_smtp_port: u16,
+        manual_smtp_implicit_tls: bool,
+    ) -> zbus::fdo::Result<(bool, String)> {
+        let manual = if manual_imap_host.is_empty() {
+            None
+        } else {
+            Some(ManualServerSettings {
+                imap_host: manual_imap_host,
+                imap_port: manual_imap_port,
+                imap_security: security_from_bool(manual_imap_implicit_tls),
+                smtp_host: manual_smtp_host,
+                smtp_port: manual_smtp_port,
+                smtp_security: security_from_bool(manual_smtp_implicit_tls),
+            })
+        };
+
+        let req = NewAccountRequest {
+            display_name,
+            email,
+            username,
+            password: Zeroizing::new(password),
+            manual,
+        };
+
+        match account::add_account(req).await {
+            Ok(AddAccountOutcome::Added(acc)) => {
+                tracing::info!(account = %acc.id, "account added");
+                match CredentialStore::get_password(&acc.id) {
+                    Ok(password) => self.restart_sync(acc.clone(), password),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "could not read back credential to start sync")
+                    }
+                }
+                Ok((true, acc.id))
+            }
+            Ok(AddAccountOutcome::NeedsManualSettings) => {
+                tracing::info!("autodiscovery found nothing usable; manual settings needed");
+                Ok((false, String::new()))
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "add_account failed");
+                Err(zbus::fdo::Error::Failed(format!("{e:#}")))
+            }
+        }
+    }
+
+    async fn has_account(&self) -> zbus::fdo::Result<bool> {
+        let cfg = config::load().map_err(|e| zbus::fdo::Error::Failed(format!("{e:#}")))?;
+        Ok(!cfg.accounts.is_empty())
+    }
+
+    /// `(has_account, id, email, display_name)` — the latter three are
+    /// empty when `has_account` is false. `id` is the key the local
+    /// message index (SQLite) is keyed by.
+    async fn account_summary(&self) -> zbus::fdo::Result<(bool, String, String, String)> {
+        match account::account_summary() {
+            Ok(Some((id, email, display_name))) => Ok((true, id, email, display_name)),
+            Ok(None) => Ok((false, String::new(), String::new(), String::new())),
+            Err(e) => Err(zbus::fdo::Error::Failed(format!("{e:#}"))),
+        }
+    }
+
+    /// Removes the configured account (credential + config) and stops its
+    /// background sync loop. Returns `false` if there was no account to
+    /// remove.
+    async fn remove_account(&self) -> zbus::fdo::Result<bool> {
+        let removed =
+            account::remove_account().map_err(|e| zbus::fdo::Error::Failed(format!("{e:#}")))?;
+        if removed {
+            self.stop_sync();
+        }
+        Ok(removed)
+    }
+
+    /// One-shot manual sync trigger, independent of the background IDLE
+    /// loop. Returns `(synced, new_or_updated_count)` — `synced` is false
+    /// if there's no account configured.
+    async fn sync_now(&self) -> zbus::fdo::Result<(bool, u32)> {
+        let cfg = config::load().map_err(|e| zbus::fdo::Error::Failed(format!("{e:#}")))?;
+        let Some(acc) = cfg.accounts.into_iter().next() else {
+            return Ok((false, 0));
+        };
+
+        let password = CredentialStore::get_password(&acc.id)
+            .map_err(|e| zbus::fdo::Error::Failed(format!("{e:#}")))?;
+
+        let reports = sync::sync_all(acc, password)
+            .await
+            .map_err(|e| zbus::fdo::Error::Failed(format!("{e:#}")))?;
+
+        let total: u32 = reports.iter().map(|(_, r)| r.new_or_updated as u32).sum();
+        Ok((true, total))
+    }
+
+    /// Same as `sync_now`, but for one named folder instead of every
+    /// folder — for when only that folder's state actually needs to be
+    /// current right now (see `sync::sync_one_folder`'s doc comment).
+    /// Returns `(synced, new_or_updated_count)` — `synced` is false if
+    /// there's no account configured.
+    async fn sync_folder(&self, folder: String) -> zbus::fdo::Result<(bool, u32)> {
+        let cfg = config::load().map_err(|e| zbus::fdo::Error::Failed(format!("{e:#}")))?;
+        let Some(acc) = cfg.accounts.into_iter().next() else {
+            return Ok((false, 0));
+        };
+
+        let password = CredentialStore::get_password(&acc.id)
+            .map_err(|e| zbus::fdo::Error::Failed(format!("{e:#}")))?;
+
+        let report = sync::sync_one_folder(acc, password, folder)
+            .await
+            .map_err(|e| zbus::fdo::Error::Failed(format!("{e:#}")))?;
+
+        Ok((true, report.new_or_updated as u32))
+    }
+
+    /// Fetches (and caches) a message's extracted display content —
+    /// see `body::CachedMessage`'s doc comment: never the raw MIME
+    /// bytes, specifically never attachment content, even though
+    /// verifying DKIM (also done here) requires fetching all of it
+    /// over the network to compute. Returns the local path to the
+    /// small cached JSON. `(false, "")` if there's no account
+    /// configured.
+    async fn fetch_body(&self, folder: String, uid: u32) -> zbus::fdo::Result<(bool, String)> {
+        let cfg = config::load().map_err(|e| zbus::fdo::Error::Failed(format!("{e:#}")))?;
+        let Some(acc) = cfg.accounts.into_iter().next() else {
+            return Ok((false, String::new()));
+        };
+
+        let password = CredentialStore::get_password(&acc.id)
+            .map_err(|e| zbus::fdo::Error::Failed(format!("{e:#}")))?;
+
+        let path = candor_core::body::fetch_body(acc, password, folder, uid)
+            .await
+            .map_err(|e| zbus::fdo::Error::Failed(format!("{e:#}")))?;
+
+        Ok((true, path.display().to_string()))
+    }
+
+    /// Fetches a message's attachments fresh and writes them straight
+    /// to `dest_dir` — the one explicit, user-initiated path attachment
+    /// *content* ever travels over the network or touches disk at all
+    /// (see `body::fetch_and_save_attachments`'s doc comment). Never
+    /// cached, never triggered by anything but this call. Returns
+    /// `(true, saved_count)`, or `(false, 0)` if there's no account
+    /// configured.
+    async fn save_attachments(&self, folder: String, uid: u32, dest_dir: String) -> zbus::fdo::Result<(bool, u32)> {
+        let cfg = config::load().map_err(|e| zbus::fdo::Error::Failed(format!("{e:#}")))?;
+        let Some(acc) = cfg.accounts.into_iter().next() else {
+            return Ok((false, 0));
+        };
+
+        let password = CredentialStore::get_password(&acc.id)
+            .map_err(|e| zbus::fdo::Error::Failed(format!("{e:#}")))?;
+
+        let saved = candor_core::body::fetch_and_save_attachments(
+            acc,
+            password,
+            folder,
+            uid,
+            std::path::PathBuf::from(dest_dir),
+        )
+        .await
+        .map_err(|e| zbus::fdo::Error::Failed(format!("{e:#}")))?;
+
+        Ok((true, saved as u32))
+    }
+
+    /// Archives, deletes (moves to Trash), or moves a message to an
+    /// explicit folder — the GUI decides the target from the locally-
+    /// synced SPECIAL-USE attributes, or directly for "Move to…". Local-
+    /// only/instant: queues the move and removes the message from the
+    /// local cache of `from_folder` right away (see
+    /// `store::queue_move`'s doc comment); `push_pending_moves` is what
+    /// actually issues the IMAP `MOVE`, on its own unhurried schedule —
+    /// same reasoning as `queue_flag_change` for why this doesn't make
+    /// the caller wait on a live network round trip. Returns `false` if
+    /// there's no account configured.
+    async fn move_message(
+        &self,
+        from_folder: String,
+        uid: u32,
+        to_folder: String,
+    ) -> zbus::fdo::Result<bool> {
+        let cfg = config::load().map_err(|e| zbus::fdo::Error::Failed(format!("{e:#}")))?;
+        let Some(acc) = cfg.accounts.into_iter().next() else {
+            return Ok(false);
+        };
+
+        let db = candor_core::store::open().map_err(|e| zbus::fdo::Error::Failed(format!("{e:#}")))?;
+
+        // Purge the cached body (if any) when the message is actually
+        // leaving the mailbox for good — Trash or Junk. Archive does
+        // NOT purge: on Gmail specifically, "archive" just removes the
+        // Inbox label (see `move_message_by_uid` in candor-gui, which
+        // already falls back to `\All` for exactly this reason) — the
+        // message isn't gone, so there's no reason its cached body
+        // should be either. Looked up *before* `queue_move`, which
+        // deletes the source row immediately.
+        if matches!(to_folder.as_str(), "\\Trash" | "\\Junk") {
+            if let Ok(Some((message_id, _))) =
+                candor_core::store::message_id_for(&db, &acc.id, &from_folder, uid)
+            {
+                let _ = candor_core::store::purge_message_body(&db, &acc.id, &message_id);
+            }
+        }
+
+        candor_core::store::queue_move(&db, &acc.id, &from_folder, uid, &to_folder)
+            .map_err(|e| zbus::fdo::Error::Failed(format!("{e:#}")))?;
+
+        Ok(true)
+    }
+
+    /// The explicit "search the server too" action — broadens a local
+    /// search out to a live IMAP `SEARCH`, merging anything found into
+    /// the local index (see `sync::search_server`'s doc comment).
+    /// `folder` empty means every folder. Returns `(true,
+    /// found_count)`, or `(false, 0)` if there's no account configured.
+    async fn search_server(&self, folder: String, query: String) -> zbus::fdo::Result<(bool, u32)> {
+        let cfg = config::load().map_err(|e| zbus::fdo::Error::Failed(format!("{e:#}")))?;
+        let Some(acc) = cfg.accounts.into_iter().next() else {
+            return Ok((false, 0));
+        };
+
+        let password = CredentialStore::get_password(&acc.id)
+            .map_err(|e| zbus::fdo::Error::Failed(format!("{e:#}")))?;
+
+        let folder = (!folder.is_empty()).then_some(folder);
+        let count = sync::search_server(acc, password, folder, query)
+            .await
+            .map_err(|e| zbus::fdo::Error::Failed(format!("{e:#}")))?;
+
+        Ok((true, count))
+    }
+
+    /// Caches a message's already-fetched, already-parsed plain-text
+    /// body for search — called right after `candor-gui`'s `open_message`
+    /// parses it for display, since the fetch already happened and this
+    /// is free. Never exempt from retention (only starring/sending are) —
+    /// looks up the canonical `message_id`/`date` from the already-synced
+    /// row rather than trusting a freshly re-parsed value (see
+    /// `store::message_id_for`'s doc comment for why). A no-op (returns
+    /// `false`) if the message isn't cached locally, has no `Message-ID`
+    /// header to key the cache under, or is in Junk — checked here, not
+    /// just trusted from the caller's own check (`candor-gui` already
+    /// guards this too, but an audit flagged that as the one body-cache
+    /// write path relying on the GUI's discipline instead of enforcing
+    /// it daemon-side the way `fill_pending_body_cache`'s equivalent
+    /// check already does — this closes that gap).
+    async fn cache_opened_body(&self, folder: String, uid: u32, body: String) -> zbus::fdo::Result<bool> {
+        let cfg = config::load().map_err(|e| zbus::fdo::Error::Failed(format!("{e:#}")))?;
+        let Some(acc) = cfg.accounts.into_iter().next() else {
+            return Ok(false);
+        };
+
+        let db = candor_core::store::open().map_err(|e| zbus::fdo::Error::Failed(format!("{e:#}")))?;
+
+        let folders = candor_core::store::list_folders(&db, &acc.id)
+            .map_err(|e| zbus::fdo::Error::Failed(format!("{e:#}")))?;
+        let is_junk =
+            folders.iter().any(|f| f.name == folder && f.special_use.as_deref() == Some("\\Junk"));
+        if is_junk {
+            return Ok(false);
+        }
+
+        let Some((message_id, date)) =
+            candor_core::store::message_id_for(&db, &acc.id, &folder, uid)
+                .map_err(|e| zbus::fdo::Error::Failed(format!("{e:#}")))?
+        else {
+            return Ok(false);
+        };
+
+        candor_core::store::cache_message_body(&db, &acc.id, &message_id, &body, date, false)
+            .map_err(|e| zbus::fdo::Error::Failed(format!("{e:#}")))?;
+
+        Ok(true)
+    }
+
+    /// Caches the body of a message the user just sent (new compose,
+    /// Reply, or Reply All) — called right after a successful send,
+    /// using the body text already in hand client-side, so this never
+    /// touches the network. Always exempt from retention (see
+    /// `message_bodies`'s exemption rules) — this is deliberate content
+    /// the user wrote, not incidental cached-while-reading text.
+    /// `message_id` is the exact value generated client-side for this
+    /// send (`send::generate_message_id`), not re-derived here.
+    async fn cache_sent_body(&self, message_id: String, body: String, date: i64) -> zbus::fdo::Result<bool> {
+        let cfg = config::load().map_err(|e| zbus::fdo::Error::Failed(format!("{e:#}")))?;
+        let Some(acc) = cfg.accounts.into_iter().next() else {
+            return Ok(false);
+        };
+
+        let db = candor_core::store::open().map_err(|e| zbus::fdo::Error::Failed(format!("{e:#}")))?;
+        candor_core::store::cache_message_body(&db, &acc.id, &message_id, &body, Some(date), true)
+            .map_err(|e| zbus::fdo::Error::Failed(format!("{e:#}")))?;
+
+        Ok(true)
+    }
+
+    /// Records one contact — the shared write path for every source
+    /// (sent-mail auto-harvest, the reading pane's opt-in "Add to
+    /// contacts" button, and `import_contacts_csv` below, which just
+    /// calls this once per parsed row). `source` is `"sent"`,
+    /// `"manual"`, or `"csv"` — purely informational, see
+    /// `store::upsert_contact`'s doc comment. Returns `false` if
+    /// there's no account configured.
+    async fn add_contact(&self, address: String, name: String, source: String) -> zbus::fdo::Result<bool> {
+        let cfg = config::load().map_err(|e| zbus::fdo::Error::Failed(format!("{e:#}")))?;
+        let Some(acc) = cfg.accounts.into_iter().next() else {
+            return Ok(false);
+        };
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let name = (!name.is_empty()).then_some(name);
+
+        let db = candor_core::store::open().map_err(|e| zbus::fdo::Error::Failed(format!("{e:#}")))?;
+        candor_core::store::upsert_contact(&db, &acc.id, &address, name.as_deref(), &source, now)
+            .map_err(|e| zbus::fdo::Error::Failed(format!("{e:#}")))?;
+
+        Ok(true)
+    }
+
+    /// Parses a user-picked CSV export (Google/Nextcloud/Outlook/etc.)
+    /// and upserts every row with a usable address — a one-time import,
+    /// not a live sync (see `candor_group6_contacts_plan` in memory for
+    /// why real CardDAV/Google Contacts integration was ruled out).
+    /// File I/O and parsing happen here, not in the GUI, same
+    /// daemon-is-the-writer reasoning as everything else that touches
+    /// the database. Returns `(true, imported_count)`, or `(false, 0)`
+    /// if there's no account configured or the file couldn't be parsed
+    /// at all (no plausible email column).
+    async fn import_contacts_csv(&self, path: String) -> zbus::fdo::Result<(bool, u32)> {
+        let cfg = config::load().map_err(|e| zbus::fdo::Error::Failed(format!("{e:#}")))?;
+        let Some(acc) = cfg.accounts.into_iter().next() else {
+            return Ok((false, 0));
+        };
+
+        let contacts = candor_core::contacts_import::parse_contacts_csv(std::path::Path::new(&path))
+            .map_err(|e| zbus::fdo::Error::Failed(format!("{e:#}")))?;
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+
+        let db = candor_core::store::open().map_err(|e| zbus::fdo::Error::Failed(format!("{e:#}")))?;
+        let mut imported = 0u32;
+        for (name, address) in contacts {
+            candor_core::store::upsert_contact(&db, &acc.id, &address, name.as_deref(), "csv", now)
+                .map_err(|e| zbus::fdo::Error::Failed(format!("{e:#}")))?;
+            imported += 1;
+        }
+
+        Ok((true, imported))
+    }
+
+    /// Clears the `\Seen` flag on a message. Writes locally only and
+    /// returns immediately — see `queue_flag_change`'s doc comment for
+    /// why. Returns `false` if there's no account configured.
+    async fn mark_unread(&self, folder: String, uid: u32) -> zbus::fdo::Result<bool> {
+        queue_flag_change(&folder, uid, Some(false), None)
+    }
+
+    /// Sets the `\Seen` flag on a message. Local-only/instant, same as
+    /// `mark_unread`. Returns `false` if there's no account configured.
+    async fn mark_read(&self, folder: String, uid: u32) -> zbus::fdo::Result<bool> {
+        queue_flag_change(&folder, uid, Some(true), None)
+    }
+
+    /// Sets the `\Flagged` flag (star) on a message. Local-only/
+    /// instant, same as `mark_unread`. Also queues the message for
+    /// lazy background body-caching (`store::queue_body_cache`) —
+    /// starring is a deliberate "keep this findable" signal, but
+    /// fetching the body synchronously here would reintroduce exactly
+    /// the network-wait-on-a-flag-change problem this whole local-first
+    /// design exists to avoid, so the actual fetch happens later, in
+    /// the same background loop that already pushes flag/move changes.
+    /// Returns `false` if there's no account configured.
+    async fn mark_flagged(&self, folder: String, uid: u32) -> zbus::fdo::Result<bool> {
+        let ok = queue_flag_change(&folder, uid, None, Some(true))?;
+        if ok {
+            if let Ok(cfg) = config::load() {
+                if let Some(acc) = cfg.accounts.into_iter().next() {
+                    if let Ok(db) = candor_core::store::open() {
+                        let _ = candor_core::store::queue_body_cache(&db, &acc.id, &folder, uid);
+                    }
+                }
+            }
+        }
+        Ok(ok)
+    }
+
+    /// Clears the `\Flagged` flag on a message. Local-only/instant,
+    /// same as `mark_unread`. Returns `false` if there's no account
+    /// configured.
+    async fn mark_unflagged(&self, folder: String, uid: u32) -> zbus::fdo::Result<bool> {
+        queue_flag_change(&folder, uid, None, Some(false))
+    }
+
+    /// Snoozes a message until `wake_at` (unix seconds) — it disappears
+    /// from every list/unread-count until then, then reappears marked
+    /// unread. Purely local (see `store::snooze_message`'s doc comment)
+    /// — instant, no network involved at all. Returns `false` if
+    /// there's no account configured.
+    async fn schedule_message(&self, folder: String, uid: u32, wake_at: i64) -> zbus::fdo::Result<bool> {
+        let cfg = config::load().map_err(|e| zbus::fdo::Error::Failed(format!("{e:#}")))?;
+        let Some(acc) = cfg.accounts.into_iter().next() else {
+            return Ok(false);
+        };
+
+        let db = candor_core::store::open().map_err(|e| zbus::fdo::Error::Failed(format!("{e:#}")))?;
+        candor_core::store::snooze_message(&db, &acc.id, &folder, uid, wake_at)
+            .map_err(|e| zbus::fdo::Error::Failed(format!("{e:#}")))?;
+
+        Ok(true)
+    }
+
+    /// Cancels a pending snooze, making the message visible again right
+    /// away. Returns `false` if there's no account configured.
+    async fn unschedule_message(&self, folder: String, uid: u32) -> zbus::fdo::Result<bool> {
+        let cfg = config::load().map_err(|e| zbus::fdo::Error::Failed(format!("{e:#}")))?;
+        let Some(acc) = cfg.accounts.into_iter().next() else {
+            return Ok(false);
+        };
+
+        let db = candor_core::store::open().map_err(|e| zbus::fdo::Error::Failed(format!("{e:#}")))?;
+        candor_core::store::unsnooze_message(&db, &acc.id, &folder, uid)
+            .map_err(|e| zbus::fdo::Error::Failed(format!("{e:#}")))?;
+
+        Ok(true)
+    }
+
+    /// Sends a plain-text message, optionally with file attachments.
+    /// `in_reply_to`/`references` are the original message's `Message-ID`
+    /// when replying — pass empty strings for a new message. `attachments`
+    /// is a list of local file paths to read and attach as-is.
+    /// `message_id` is generated client-side by the caller
+    /// (`send::generate_message_id`) before this call, rather than
+    /// inside `build_message` as it used to be — the caller needs that
+    /// exact string back afterward to call `cache_sent_body` under the
+    /// same key the message will later sync back under, and there was
+    /// previously no way to recover it once `build_message` generated
+    /// it internally.
+    async fn send_message(
+        &self,
+        to: String,
+        subject: String,
+        body: String,
+        in_reply_to: String,
+        references: String,
+        attachments: Vec<String>,
+        message_id: String,
+    ) -> zbus::fdo::Result<()> {
+        let cfg = config::load().map_err(|e| zbus::fdo::Error::Failed(format!("{e:#}")))?;
+        let Some(acc) = cfg.accounts.into_iter().next() else {
+            return Err(zbus::fdo::Error::Failed("no account configured".to_string()));
+        };
+
+        let password = CredentialStore::get_password(&acc.id)
+            .map_err(|e| zbus::fdo::Error::Failed(format!("{e:#}")))?;
+
+        let msg = candor_core::send::OutgoingMessage {
+            to,
+            subject,
+            body,
+            in_reply_to: (!in_reply_to.is_empty()).then_some(in_reply_to),
+            references: (!references.is_empty()).then_some(references),
+            attachments: attachments.into_iter().map(std::path::PathBuf::from).collect(),
+            message_id,
+        };
+
+        candor_core::send::send(&acc, &password, msg)
+            .await
+            .map_err(|e| zbus::fdo::Error::Failed(format!("{e:#}")))?;
+
+        tracing::info!("message sent");
+        Ok(())
+    }
+
+    /// Saves a message to the account's `\Drafts` folder via IMAP
+    /// `APPEND` instead of sending it — this is the "back out of
+    /// compose and it's waiting for you later" behavior. Unlike the
+    /// flag/move actions, this is a real network round trip, same as
+    /// `send_message`: there's no sensible local-only stand-in for "a
+    /// brand new message now exists in Drafts" the way there is for
+    /// flipping a flag on a message already cached. Returns `false` if
+    /// there's no account configured or no `\Drafts` folder has been
+    /// synced yet.
+    async fn save_draft(
+        &self,
+        to: String,
+        subject: String,
+        body: String,
+        in_reply_to: String,
+        references: String,
+        message_id: String,
+    ) -> zbus::fdo::Result<bool> {
+        let cfg = config::load().map_err(|e| zbus::fdo::Error::Failed(format!("{e:#}")))?;
+        let Some(acc) = cfg.accounts.into_iter().next() else {
+            return Ok(false);
+        };
+
+        let db = candor_core::store::open().map_err(|e| zbus::fdo::Error::Failed(format!("{e:#}")))?;
+        let folders = candor_core::store::list_folders(&db, &acc.id)
+            .map_err(|e| zbus::fdo::Error::Failed(format!("{e:#}")))?;
+        let Some(drafts_folder) =
+            folders.into_iter().find(|f| f.special_use.as_deref() == Some("\\Drafts")).map(|f| f.name)
+        else {
+            return Ok(false);
+        };
+
+        let password = CredentialStore::get_password(&acc.id)
+            .map_err(|e| zbus::fdo::Error::Failed(format!("{e:#}")))?;
+
+        let msg = candor_core::send::OutgoingMessage {
+            to,
+            subject,
+            body,
+            in_reply_to: (!in_reply_to.is_empty()).then_some(in_reply_to),
+            references: (!references.is_empty()).then_some(references),
+            attachments: Vec::new(),
+            message_id,
+        };
+
+        candor_core::send::save_draft(&acc, &password, &drafts_folder, msg)
+            .await
+            .map_err(|e| zbus::fdo::Error::Failed(format!("{e:#}")))?;
+
+        Ok(true)
+    }
+}
+
+/// Writes a `\Seen`/`\Flagged` change locally and queues it for
+/// `push_pending_flags` to actually tell the server later — the
+/// read/unread/star actions never need to wait on an IMAP round trip,
+/// which used to make the whole GUI feel like it had locked up for the
+/// several seconds a real `STORE` command over the network can take.
+/// `seen`/`flagged` are `None` for whichever one this particular call
+/// isn't meant to touch (e.g. `mark_read` only ever means `\Seen`) —
+/// the current value for that one is read back from the local store
+/// first so it doesn't get clobbered.
+fn queue_flag_change(folder: &str, uid: u32, seen: Option<bool>, flagged: Option<bool>) -> zbus::fdo::Result<bool> {
+    let cfg = config::load().map_err(|e| zbus::fdo::Error::Failed(format!("{e:#}")))?;
+    let Some(acc) = cfg.accounts.into_iter().next() else {
+        return Ok(false);
+    };
+
+    let db = candor_core::store::open().map_err(|e| zbus::fdo::Error::Failed(format!("{e:#}")))?;
+    let (current_seen, current_flagged) =
+        candor_core::store::get_flags(&db, &acc.id, folder, uid)
+            .map_err(|e| zbus::fdo::Error::Failed(format!("{e:#}")))?
+            .unwrap_or((false, false));
+
+    candor_core::store::update_flags_pending(
+        &db,
+        &acc.id,
+        folder,
+        uid,
+        seen.unwrap_or(current_seen),
+        flagged.unwrap_or(current_flagged),
+    )
+    .map_err(|e| zbus::fdo::Error::Failed(format!("{e:#}")))?;
+
+    Ok(true)
+}
+
+/// Processes every message queued for lazy body-caching since the last
+/// run (`store::queue_body_cache` — written by `mark_flagged`, i.e.
+/// starring) — fetches each one's body over the network and caches its
+/// extracted plain text, exempt from retention. Run from the same
+/// `PENDING_PUSH_INTERVAL` background loop that already pushes flag/
+/// move changes, never synchronously from the star action itself. A
+/// message that's since vanished (deleted, moved away) or landed in
+/// Junk just drops out of the queue without being cached — there's
+/// nothing wrong with that, it's the same "best effort, catches up
+/// eventually" spirit as the rest of this loop.
+async fn fill_pending_body_cache(account: &config::AccountConfig, password: &str) -> anyhow::Result<()> {
+    let db = candor_core::store::open()?;
+    let queued = candor_core::store::pending_body_cache(&db, &account.id)?;
+    if queued.is_empty() {
+        return Ok(());
+    }
+
+    let folders = candor_core::store::list_folders(&db, &account.id)?;
+
+    for (folder, uid) in queued {
+        let is_junk = folders
+            .iter()
+            .any(|f| f.name == folder && f.special_use.as_deref() == Some("\\Junk"));
+        let Some((message_id, date)) = candor_core::store::message_id_for(&db, &account.id, &folder, uid)?
+        else {
+            candor_core::store::clear_pending_body_cache(&db, &account.id, &folder, uid)?;
+            continue;
+        };
+        if is_junk {
+            candor_core::store::clear_pending_body_cache(&db, &account.id, &folder, uid)?;
+            continue;
+        }
+
+        match candor_core::body::fetch_body_text(
+            account.clone(),
+            password.to_string(),
+            folder.clone(),
+            uid,
+        )
+        .await
+        {
+            Ok(Some(text)) => {
+                candor_core::store::cache_message_body(&db, &account.id, &message_id, &text, date, true)?;
+            }
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!(error = %e, folder = %folder, uid, "failed to fetch body for background caching");
+                // Leave it queued — worth retrying next interval rather
+                // than silently dropping it on a transient network
+                // failure.
+                continue;
+            }
+        }
+        candor_core::store::clear_pending_body_cache(&db, &account.id, &folder, uid)?;
+    }
+
+    Ok(())
+}
+
+/// Applies the user's configured retention caps to both caches this
+/// app keeps locally — the searchable body cache (`AppSettings::
+/// body_cache_max_age_days`/`body_cache_max_bytes`, see
+/// `store::evict_expired_bodies`'s doc comment) and the reading-pane
+/// display cache (`AppSettings::reading_cache_max_bytes`, see
+/// `body::enforce_cache_size_cap`'s doc comment) — two genuinely
+/// different caches with their own shapes and caps, not one setting
+/// doing double duty. Purely local, no network, so this runs
+/// synchronously in the same loop tick rather than needing its own
+/// task.
+fn run_retention_sweep(account_id: &str) -> anyhow::Result<()> {
+    let cfg = config::load()?;
+
+    let db = candor_core::store::open()?;
+    let evicted = candor_core::store::evict_expired_bodies(
+        &db,
+        account_id,
+        cfg.settings.body_cache_max_age_days,
+        cfg.settings.body_cache_max_bytes,
+    )?;
+    if evicted > 0 {
+        tracing::info!(count = evicted, "evicted cached bodies past retention limits");
+    }
+
+    if let Some(max_bytes) = cfg.settings.reading_cache_max_bytes {
+        let evicted = candor_core::body::enforce_cache_size_cap(account_id, max_bytes)?;
+        if evicted > 0 {
+            tracing::info!(count = evicted, "evicted reading-pane cache entries past size cap");
+        }
+    }
+
+    Ok(())
+}
+
+fn security_from_bool(implicit_tls: bool) -> Security {
+    if implicit_tls {
+        Security::ImplicitTls
+    } else {
+        Security::StartTls
+    }
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    tracing_subscriber::fmt::init();
+
+    let cfg = config::load()?;
+    tracing::info!(accounts = cfg.accounts.len(), "candor-daemon starting");
+
+    let service = DaemonService::new();
+
+    if let Some(account) = cfg.accounts.into_iter().next() {
+        match CredentialStore::get_password(&account.id) {
+            Ok(password) => service.restart_sync(account, password),
+            Err(e) => {
+                tracing::warn!(error = %e, "could not read stored credential; sync not started")
+            }
+        }
+    }
+
+    let _conn = Builder::session()
+        .name("dev.candor.Daemon1")
+        .serve_at("/dev/candor/Daemon1", service)
+        .build()
+        .await?;
+
+    tracing::info!("D-Bus service registered as dev.candor.Daemon1, waiting for requests");
+    tokio::signal::ctrl_c().await?;
+    tracing::info!("shutting down");
+    Ok(())
+}

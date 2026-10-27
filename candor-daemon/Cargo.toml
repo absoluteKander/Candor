@@ -1,0 +1,13 @@
+[package]
+name = "candor-daemon"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+candor-core = { version = "0.1.0", path = "../candor-core" }
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "net", "time", "signal"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+zbus = { version = "6.1.0", default-features = false, features = ["tokio", "proxy", "service"] }
+zeroize = "1.9.1"
