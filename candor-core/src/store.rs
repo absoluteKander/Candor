@@ -3,6 +3,7 @@
 //! Message bodies are not stored here — only what's needed to render a
 //! message list; bodies are fetched on demand when a message is opened.
 
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
@@ -17,8 +18,7 @@ pub fn db_path() -> Result<PathBuf> {
 pub fn open() -> Result<Connection> {
     let path = db_path()?;
     if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)
-            .with_context(|| format!("creating data dir {}", dir.display()))?;
+        crate::config::create_private_dir_all(dir)?;
     }
 
     let conn = Connection::open(&path)
@@ -27,6 +27,23 @@ pub fn open() -> Result<Connection> {
         .context("enabling WAL mode")?;
 
     apply_schema(&conn)?;
+
+    // SQLite creates the main db file — and, in WAL mode, `-wal`/`-shm`
+    // sibling files — using the process's own umask (commonly `0644`,
+    // world-readable), with no way to ask it for anything stricter up
+    // front. This database holds real cached email content (subjects,
+    // senders, and — for starred/sent mail — full bodies), not just
+    // opaque local state, so permissions are tightened explicitly here
+    // rather than left at whatever the umask happened to produce.
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("setting permissions on {}", path.display()))?;
+    for suffix in ["-wal", "-shm"] {
+        let sibling = PathBuf::from(format!("{}{suffix}", path.display()));
+        if sibling.exists() {
+            let _ = std::fs::set_permissions(&sibling, std::fs::Permissions::from_mode(0o600));
+        }
+    }
+
     Ok(conn)
 }
 
@@ -858,9 +875,11 @@ pub struct Contact {
 /// or eviction: unlike the mark-read-vs-starred distinction in
 /// `message_bodies`, there's no noisy-source problem left to solve
 /// here, since the one noisy path (auto-harvesting Reply/Reply-All
-/// recipients) was deliberately never built — see
-/// `candor_group6_contacts_plan` in memory for why. `name` only
-/// overwrites the stored name when a non-empty one is given, so a
+/// recipients) was deliberately never built: replying to someone
+/// doesn't mean you want them suggested forever, and every mailing
+/// list or automated sender you've ever answered would end up in
+/// contacts otherwise. `name` only overwrites the stored name when a
+/// non-empty one is given, so a
 /// later call that doesn't know the name (e.g. CSV rows with no name
 /// column) never blanks out one already on file.
 pub fn upsert_contact(

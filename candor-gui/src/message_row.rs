@@ -242,7 +242,7 @@ impl FactoryComponent for MessageRow {
                                         add_css_class: "flat",
                                         connect_clicked[sender, uid = self.summary.uid] => move |_| {
                                             sender.output(MessageRowOutput::Schedule {
-                                                uid, wake_at: crate::schedule_in_one_hour(),
+                                                uid, wake_at: crate::account_tab::schedule_in_one_hour(),
                                             }).ok();
                                         },
                                     },
@@ -251,7 +251,7 @@ impl FactoryComponent for MessageRow {
                                         add_css_class: "flat",
                                         connect_clicked[sender, uid = self.summary.uid] => move |_| {
                                             sender.output(MessageRowOutput::Schedule {
-                                                uid, wake_at: crate::schedule_this_evening(),
+                                                uid, wake_at: crate::account_tab::schedule_this_evening(),
                                             }).ok();
                                         },
                                     },
@@ -260,7 +260,7 @@ impl FactoryComponent for MessageRow {
                                         add_css_class: "flat",
                                         connect_clicked[sender, uid = self.summary.uid] => move |_| {
                                             sender.output(MessageRowOutput::Schedule {
-                                                uid, wake_at: crate::schedule_tomorrow_morning(),
+                                                uid, wake_at: crate::account_tab::schedule_tomorrow_morning(),
                                             }).ok();
                                         },
                                     },
@@ -269,7 +269,7 @@ impl FactoryComponent for MessageRow {
                                         add_css_class: "flat",
                                         connect_clicked[sender, uid = self.summary.uid] => move |_| {
                                             sender.output(MessageRowOutput::Schedule {
-                                                uid, wake_at: crate::schedule_next_week(),
+                                                uid, wake_at: crate::account_tab::schedule_next_week(),
                                             }).ok();
                                         },
                                     },

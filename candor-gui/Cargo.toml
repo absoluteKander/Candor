@@ -15,6 +15,9 @@ scraper = "0.29.0"
 serde = { version = "1.0.229", features = ["derive"] }
 tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "sync", "fs"] }
 toml = "1.1.8"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 ureq = "3.5.0"
 url = "2.5.8"
 zbus = { version = "6.1.0", default-features = false, features = ["tokio", "proxy"] }
+zeroize = "1.9.1"

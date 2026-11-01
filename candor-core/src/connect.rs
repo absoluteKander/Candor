@@ -3,21 +3,24 @@
 //! fails here is never written to the keyring or config file.
 
 use anyhow::{anyhow, bail, Context, Result};
-use lettre::transport::smtp::authentication::Credentials;
+use lettre::transport::smtp::authentication::{Credentials, Mechanism};
 use lettre::{AsyncSmtpTransport, Tokio1Executor};
+use zeroize::Zeroizing;
 
-use crate::config::Security;
+use crate::config::{AuthMethod, Security};
+use crate::oauth::XOAuth2;
 
 pub async fn test_imap(
     host: &str,
     port: u16,
     security: Security,
     username: &str,
-    password: &str,
+    secret: &str,
+    auth_method: AuthMethod,
 ) -> Result<()> {
     let host = host.to_string();
     let username = username.to_string();
-    let password = password.to_string();
+    let secret = Zeroizing::new(secret.to_string());
 
     tokio::task::spawn_blocking(move || {
         let tls = native_tls::TlsConnector::builder()
@@ -33,9 +36,17 @@ pub async fn test_imap(
             }
         };
 
-        let mut session = client
-            .login(&username, &password)
-            .map_err(|(e, _client)| anyhow!("IMAP login failed: {e}"))?;
+        let mut session = match auth_method {
+            AuthMethod::Password => client
+                .login(&username, &secret)
+                .map_err(|(e, _client)| anyhow!("IMAP login failed: {e}"))?,
+            AuthMethod::OAuthMicrosoft => {
+                let auth = XOAuth2 { user: username, access_token: secret };
+                client
+                    .authenticate("XOAUTH2", &auth)
+                    .map_err(|(e, _client)| anyhow!("IMAP XOAUTH2 failed: {e}"))?
+            }
+        };
         let _ = session.logout();
         Ok(())
     })
@@ -48,15 +59,20 @@ pub async fn test_smtp(
     port: u16,
     security: Security,
     username: &str,
-    password: &str,
+    secret: &str,
+    auth_method: AuthMethod,
 ) -> Result<()> {
-    let creds = Credentials::new(username.to_string(), password.to_string());
+    let creds = Credentials::new(username.to_string(), secret.to_string());
 
-    let builder = match security {
+    let mut builder = match security {
         Security::ImplicitTls => AsyncSmtpTransport::<Tokio1Executor>::relay(host),
         Security::StartTls => AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(host),
     }
     .with_context(|| format!("building SMTP transport for {host}"))?;
+
+    if auth_method == AuthMethod::OAuthMicrosoft {
+        builder = builder.authentication(vec![Mechanism::Xoauth2]);
+    }
 
     let transport: AsyncSmtpTransport<Tokio1Executor> =
         builder.port(port).credentials(creds).build();

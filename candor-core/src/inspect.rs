@@ -205,29 +205,57 @@ fn display_name_embeds_different_domain(name: &str, real_domain: &str) -> bool {
 
 fn inspect_provider_auth_results(message: &Message, verdict: &mut MessageVerdict) {
     // Multiple Authentication-Results headers can exist (one per relay
-    // hop); we trust only the first (topmost), on the standard assumption
-    // that it's the one our own receiving provider just added. A client
-    // can't reliably tell which hop is actually trustworthy without
-    // knowing its own provider's hostname, so this is a best-effort read,
-    // not independent verification — unlike the DKIM check below.
-    let Some(header) = message.header_raw("Authentication-Results") else {
+    // hop, and a sender can also just forge one into the original
+    // message before it's ever delivered) — we trust only the first
+    // (topmost), on the standard assumption that it's the one our own
+    // receiving provider just prepended, with anything the message
+    // already had pushed further down. A client can't reliably tell
+    // which hop is actually trustworthy without knowing its own
+    // provider's hostname, so this is a best-effort read, not
+    // independent verification — unlike the DKIM check below.
+    //
+    // `Message::header_raw` was tried here first and empirically
+    // confirmed (not assumed) to return the *last* matching header, not
+    // the first — the opposite of what this function needs, and exactly
+    // backwards from a now-removed comment that had assumed otherwise.
+    // `header_values` iterates in document order; `.next()` is the
+    // actual topmost occurrence.
+    let Some(header) = message.header_values("Authentication-Results").next().and_then(|v| v.as_text())
+    else {
         return;
     };
     verdict.spf_pass = extract_auth_result(header, "spf");
     verdict.dmarc_pass = extract_auth_result(header, "dmarc");
 }
 
+/// Per RFC 8601, an Authentication-Results header is `;`-separated
+/// `resinfo` clauses, each starting with its own `method=result` pair
+/// (e.g. `spf=pass smtp.mailfrom=example.com`) — properties like that
+/// `smtp.mailfrom=` are allowed to echo back sender-controlled data
+/// (the envelope-from address, a header.from value, etc.), so this
+/// deliberately checks each clause's *own leading* `method=` token,
+/// not a flat substring search across the whole header text. A naive
+/// `header.find("spf=")` would also match "spf=" appearing anywhere —
+/// including inside some other clause's property value — which isn't
+/// exploitable given how the clauses are actually ordered by a
+/// well-behaved server, but there's no reason to rely on that when
+/// parsing by clause is just as simple and removes the question
+/// entirely.
 fn extract_auth_result(header: &str, mechanism: &str) -> Option<bool> {
     let needle = format!("{mechanism}=");
-    let lower = header.to_ascii_lowercase();
-    let idx = lower.find(&needle)?;
-    let rest = &header[idx + needle.len()..];
-    let word: String = rest.chars().take_while(|c| c.is_ascii_alphabetic()).collect();
-    match word.to_ascii_lowercase().as_str() {
-        "pass" => Some(true),
-        "fail" | "softfail" | "none" | "neutral" | "temperror" | "permerror" => Some(false),
-        _ => None,
+    for clause in header.split(';') {
+        let clause = clause.trim();
+        let lower = clause.to_ascii_lowercase();
+        if let Some(rest) = lower.strip_prefix(&needle) {
+            let word: String = rest.chars().take_while(|c| c.is_ascii_alphabetic()).collect();
+            return match word.as_str() {
+                "pass" => Some(true),
+                "fail" | "softfail" | "none" | "neutral" | "temperror" | "permerror" => Some(false),
+                _ => None,
+            };
+        }
     }
+    None
 }
 
 /// Independently verifies DKIM ourselves — unlike SPF/DMARC, this needs no
@@ -465,6 +493,149 @@ fn inspect_attachments(message: &Message, verdict: &mut MessageVerdict) {
                     reason: AttachmentWarningReason::MismatchedType { claimed, detected },
                 });
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression test for a real bug: `inspect_provider_auth_results`
+    /// used to read `Message::header_raw`, which — confirmed
+    /// empirically against this exact pinned `mail-parser` version, not
+    /// assumed from its documentation (which doesn't specify this) —
+    /// returns the *last* matching header when a name repeats, not the
+    /// first. That's exactly backwards: a forged `Authentication-Results`
+    /// header a sender embeds in the original message ends up *below*
+    /// the real receiving server's own header once the server prepends
+    /// it, so trusting the last occurrence means trusting the forged
+    /// one over the real one. This message simulates exactly that
+    /// delivery shape — legitimate header on top, forged one beneath —
+    /// and asserts the legitimate (first) values win.
+    #[test]
+    fn auth_results_trusts_the_first_header_not_the_last() {
+        let raw = b"From: attacker@evil.com\r\n\
+Authentication-Results: legit-server.example.com; spf=pass smtp.mailfrom=attacker.com; dmarc=pass\r\n\
+Authentication-Results: forged-by-sender.invalid; spf=fail smtp.mailfrom=victim.com; dmarc=fail\r\n\
+Subject: test\r\n\
+\r\n\
+body\r\n";
+        let message = MessageParser::default().parse(raw).unwrap();
+        let mut verdict = MessageVerdict::default();
+        inspect_provider_auth_results(&message, &mut verdict);
+
+        assert_eq!(verdict.spf_pass, Some(true));
+        assert_eq!(verdict.dmarc_pass, Some(true));
+    }
+
+    /// `extract_auth_result` parses by `;`-separated clause, matching
+    /// only a clause's own leading `method=` token — not a flat
+    /// substring search across the whole header. This constructs a
+    /// header where the `dkim=` clause's own property happens to
+    /// contain the literal text "spf=pass" (plausible if a sender gets
+    /// to influence an echoed-back property value, however narrow that
+    /// path really is) positioned *before* the real `spf=` clause, and
+    /// asserts the real clause's result is still what gets picked up.
+    #[test]
+    fn auth_result_extraction_is_not_confused_by_substrings_in_other_clauses() {
+        let header =
+            "mx.example.com; dkim=fail header.d=\"spf=pass lookalike\"; spf=fail smtp.mailfrom=attacker.com";
+        assert_eq!(extract_auth_result(header, "spf"), Some(false));
+    }
+
+    /// A message with only one Authentication-Results header (the
+    /// common case) still needs to parse correctly — makes sure the
+    /// fix for the above didn't just special-case the multi-header
+    /// scenario.
+    #[test]
+    fn auth_results_single_header_still_works() {
+        let raw = b"From: someone@example.com\r\n\
+Authentication-Results: mx.example.com; spf=fail smtp.mailfrom=someone@example.com; dmarc=fail\r\n\
+Subject: test\r\n\
+\r\n\
+body\r\n";
+        let message = MessageParser::default().parse(raw).unwrap();
+        let mut verdict = MessageVerdict::default();
+        inspect_provider_auth_results(&message, &mut verdict);
+
+        assert_eq!(verdict.spf_pass, Some(false));
+        assert_eq!(verdict.dmarc_pass, Some(false));
+    }
+}
+
+/// Adversarial-input tests — deliberately distinct from `mod tests`
+/// above. Those confirm a specific fix produces the *correct* result;
+/// these confirm the inspection pipeline *fails safely* against input
+/// that's actively hostile or malformed, which is the expected shape
+/// of real email per this project's zero-trust-toward-email-content
+/// policy (see `SECURITY.md`). A test in here is supposed to exercise
+/// a failure path, not a success path — if one of these ever starts
+/// needing a happy assertion to stay meaningful, it's drifted out of
+/// this module's purpose and belongs in `mod tests` instead.
+#[cfg(test)]
+mod adversarial_input_tests {
+    use super::*;
+
+    /// Every one of these is either empty, truncated mid-structure, or
+    /// outright not a valid email — the inspection pipeline's job is
+    /// to not crash on any of it, not to make sense of it. A real
+    /// inbox will eventually contain something this malformed, whether
+    /// from a broken sender or a deliberately crafted attack, and a
+    /// panic here would take down the daemon process handling every
+    /// other account's mail too.
+    #[test]
+    fn garbage_bytes_never_panic_the_parser() {
+        let cases: Vec<&[u8]> = vec![
+            b"",
+            b"\x00\x01\x02\xff\xfe garbage not an email at all",
+            b"From: \r\n\r\n",
+            b"Authentication-Results: ; spf= dmarc= spf=spf=spf=\r\n\r\n",
+            b"Content-Type: multipart/mixed; boundary=x\r\n\r\n--x\r\n--x\r\n--x\r\n--x\r\n",
+            b"Subject: \xc3\x28 invalid utf8 sequence\r\n\r\n",
+            b"From: a@b\r\nFrom: c@d\r\nFrom: e@f\r\n\r\nduplicate From headers",
+        ];
+        for raw in cases {
+            let _ = MessageParser::default().parse(raw);
+        }
+    }
+
+    /// A message can legitimately nest multipart sections a few levels
+    /// deep; nothing legitimate nests them thousands of levels deep.
+    /// This is exactly the shape of a resource-exhaustion attack
+    /// (a tiny message that's expensive or crash-prone to parse) — the
+    /// assertion here is just "this returns in a reasonable time and
+    /// doesn't panic," not anything about the parsed result's content.
+    #[test]
+    fn pathologically_nested_mime_does_not_crash_or_hang() {
+        let mut raw = String::from("Content-Type: multipart/mixed; boundary=b0\r\n\r\n");
+        for i in 0..2000 {
+            raw.push_str(&format!("--b0\r\nContent-Type: multipart/mixed; boundary=b{}\r\n\r\n", i + 1));
+        }
+        let _ = MessageParser::default().parse(raw.as_bytes());
+    }
+
+    /// `extract_auth_result` specifically, fed header text that's
+    /// hostile in ways a real mail server would never produce but a
+    /// crafted/forged header could: absurdly long, deeply repeated
+    /// delimiters, no valid clause at all. The only requirement is
+    /// "returns, doesn't panic" — `None` is the correct answer for
+    /// all of these, same as for a header this function genuinely
+    /// doesn't understand.
+    #[test]
+    fn auth_result_extraction_never_panics_on_hostile_header_text() {
+        let cases = [
+            "",
+            ";;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;",
+            "spf=",
+            "spf=spf=spf=spf=spf=spf=spf=pass",
+            &"spf=pass;".repeat(10_000),
+            "spf=\u{0}\u{0}\u{0}pass",
+            "spf=pásss", // non-ASCII near the result word
+        ];
+        for header in cases {
+            let _ = extract_auth_result(header, "spf");
+            let _ = extract_auth_result(header, "dmarc");
         }
     }
 }

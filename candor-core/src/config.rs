@@ -5,10 +5,12 @@
 //! file on disk — they live in the OS secret service (keyring) and are
 //! looked up at connect time via `CredentialStore`.
 
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroizing;
 
 const KEYRING_SERVICE: &str = "candor";
 
@@ -19,10 +21,11 @@ pub enum Security {
 }
 
 /// One of a small, fixed set of preset colors a tab can be assigned —
-/// deliberately a minimal picker, not a full color wheel (see
-/// `candor_group7_multiaccount_plan` in memory). The actual hex/CSS
-/// mapping for each preset belongs to `candor-gui`, not here — this
-/// crate just stores which one was chosen.
+/// deliberately a minimal picker, not a full color wheel: a handful of
+/// clearly-distinct presets are faster to tell apart at a glance than
+/// picking from a gradient would be. The actual hex/CSS mapping for
+/// each preset belongs to `candor-gui`, not here — this crate just
+/// stores which one was chosen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TabColor {
     Blue,
@@ -39,6 +42,23 @@ impl Default for TabColor {
     fn default() -> Self {
         TabColor::Blue
     }
+}
+
+/// How an account authenticates. `Password` (the default) covers every
+/// provider that still accepts a plain password or a provider-issued
+/// app-specific password — Gmail, Yahoo, iCloud, Fastmail, Zoho. Microsoft
+/// is phasing out that kind of login for Outlook.com/Microsoft 365
+/// entirely, so `OAuthMicrosoft` is the real OAuth2 Authorization Code +
+/// PKCE flow for those accounts — see `oauth.rs`. Either way, the actual
+/// secret lives in the keyring under the same key: a plain password
+/// string for `Password`, or a JSON-serialized access/refresh token pair
+/// for `OAuthMicrosoft`. `CredentialStore` itself doesn't need to know
+/// which — only the code that uses the secret to authenticate does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum AuthMethod {
+    #[default]
+    Password,
+    OAuthMicrosoft,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -65,10 +85,19 @@ pub struct AccountConfig {
     /// Enforced in two places at once: the Send control is disabled/
     /// unfocusable in the GUI, *and* the daemon's own `send_message`
     /// handler refuses to send while this is `true`, so there's no
-    /// path that bypasses it by only disabling one button. See
-    /// `candor_group7_multiaccount_plan` in memory.
+    /// path that bypasses it by only disabling one button.
     #[serde(default = "default_locked")]
     pub locked: bool,
+    /// Whether this account's tab suppresses the sun/rays new-mail
+    /// pulse and (for the default tab) real OS notifications — a
+    /// deliberate "last resort" the user reaches for explicitly, not
+    /// something the app ever sets on its own. Unlike `locked`, starts
+    /// `false` (unmuted) for a newly-added account: there's no safety
+    /// reason to default this one closed, and a brand-new account
+    /// silently never notifying you would just look broken. Toggled
+    /// from the tab strip's own notification icon, not Settings.
+    #[serde(default)]
+    pub muted: bool,
     /// Fixed tab position, assigned when the account is added and
     /// changed only through an explicit Settings action — never by
     /// live drag-reordering. Reordering live risks silently swapping
@@ -99,6 +128,9 @@ pub struct AccountConfig {
     /// back to the lowest `tab_order`.
     #[serde(default)]
     pub is_default: bool,
+    /// See `AuthMethod`'s own doc comment.
+    #[serde(default)]
+    pub auth_method: AuthMethod,
 }
 
 fn default_locked() -> bool {
@@ -171,6 +203,18 @@ pub struct AppSettings {
     /// first once exceeded.
     #[serde(default)]
     pub reading_cache_max_bytes: Option<u64>,
+    /// Whether clicking a system-level new-mail notification (only
+    /// ever produced by the default-tab account) also marks that
+    /// message read, on top of the flash-to-it-in-the-list behavior it
+    /// always does. Default `false`: clicking a notification is
+    /// deliberately never itself a "read" action anywhere else in this
+    /// app (same as switching tabs or panes), and whether a passive
+    /// notification click should be the one exception is explicitly
+    /// left to the user rather than assumed either way — see this
+    /// field's own design discussion for the user's exact framing
+    /// ("im not opposed to it, but its not our decision").
+    #[serde(default)]
+    pub mark_read_on_notification_click: bool,
 }
 
 fn default_bulk_select_threshold() -> usize {
@@ -186,8 +230,33 @@ impl Default for AppSettings {
             body_cache_max_bytes: None,
             idle_timeout_minutes: None,
             reading_cache_max_bytes: None,
+            mark_read_on_notification_click: false,
         }
     }
+}
+
+/// Creates `dir` (and any missing parents) owner-only (`0700`) instead
+/// of whatever the process's umask would otherwise leave (commonly
+/// `0755`, world-readable and world-traversable). Everything Candor
+/// stores locally under a directory like this — the message index,
+/// cached bodies, account config — can hold real email content or
+/// addresses, not just opaque data, so this isn't optional hardening
+/// on a shared/multi-user system; it's the whole point of using the
+/// OS keyring for credentials specifically while still caching
+/// everything *else* locally.
+pub(crate) fn create_private_dir_all(dir: &std::path::Path) -> Result<()> {
+    std::fs::create_dir_all(dir).with_context(|| format!("creating directory {}", dir.display()))?;
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+        .with_context(|| format!("setting permissions on {}", dir.display()))
+}
+
+/// Writes `contents` to `path` owner-only (`0600`) instead of whatever
+/// the process's umask would otherwise leave (commonly `0644`,
+/// world-readable). Same reasoning as `create_private_dir_all`.
+pub(crate) fn write_private(path: &std::path::Path, contents: &[u8]) -> Result<()> {
+    std::fs::write(path, contents).with_context(|| format!("writing {}", path.display()))?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("setting permissions on {}", path.display()))
 }
 
 pub fn config_dir() -> Result<PathBuf> {
@@ -212,10 +281,9 @@ pub fn load() -> Result<AppConfig> {
 
 pub fn save(config: &AppConfig) -> Result<()> {
     let dir = config_dir()?;
-    std::fs::create_dir_all(&dir)
-        .with_context(|| format!("creating config dir {}", dir.display()))?;
+    create_private_dir_all(&dir)?;
     let raw = toml::to_string_pretty(config).context("serializing accounts.toml")?;
-    std::fs::write(config_path()?, raw).context("writing accounts.toml")
+    write_private(&config_path()?, raw.as_bytes())
 }
 
 /// Looks up and stores account secrets (passwords, OAuth tokens) in the
@@ -223,10 +291,18 @@ pub fn save(config: &AppConfig) -> Result<()> {
 pub struct CredentialStore;
 
 impl CredentialStore {
-    pub fn get_password(account_id: &str) -> Result<String> {
+    /// Returns `Zeroizing<String>`, not a plain `String` — this is the
+    /// single point every credential read in the app goes through
+    /// (directly, or via `oauth::resolve_credential`), so wrapping it
+    /// here is what actually makes the rest of the zeroizing chain
+    /// meaningful: without it, every caller would need to immediately
+    /// re-wrap a value that already leaked a plain, non-zeroizing copy
+    /// into memory on the way out of this function.
+    pub fn get_password(account_id: &str) -> Result<Zeroizing<String>> {
         let entry = keyring::Entry::new(KEYRING_SERVICE, account_id)?;
         entry
             .get_password()
+            .map(Zeroizing::new)
             .with_context(|| format!("no credential stored for account '{account_id}'"))
     }
 
@@ -240,5 +316,49 @@ impl CredentialStore {
         let entry = keyring::Entry::new(KEYRING_SERVICE, account_id)?;
         entry.delete_credential()?;
         Ok(())
+    }
+}
+
+/// Security regression suite for this file — see the project's
+/// `SECURITY.md` for the methodology. These check the actual on-disk
+/// permission bits after the fact, not just that the functions run
+/// without error — a bug here is exactly the kind that "it compiled
+/// and didn't panic" would never catch.
+#[cfg(test)]
+mod security_regression_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+
+    fn scratch_path(label: &str) -> std::path::PathBuf {
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!("candor_config_privacy_test_{label}_{n}"))
+    }
+
+    fn mode_of(path: &std::path::Path) -> u32 {
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    /// Guards the local-file-permissions fix: before it, directories
+    /// Candor creates for its own data were left at whatever the
+    /// process umask produced (commonly `0755`, world-readable and
+    /// world-traversable) — on a shared machine, any other local
+    /// account could read into it.
+    #[test]
+    fn private_dir_is_actually_owner_only_on_disk() {
+        let dir = scratch_path("dir");
+        create_private_dir_all(&dir).unwrap();
+        assert_eq!(mode_of(&dir), 0o700, "directory permissions were not tightened");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Same, for the files themselves (commonly `0644` by default).
+    #[test]
+    fn private_file_is_actually_owner_only_on_disk() {
+        let path = scratch_path("file");
+        write_private(&path, b"test content").unwrap();
+        assert_eq!(mode_of(&path), 0o600, "file permissions were not tightened");
+        std::fs::remove_file(&path).ok();
     }
 }

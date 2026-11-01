@@ -24,35 +24,59 @@ pub trait Daemon {
         manual_smtp_implicit_tls: bool,
     ) -> zbus::Result<(bool, String)>;
 
+    /// The OAuth2 equivalent of `add_account` — the GUI runs the actual
+    /// interactive Microsoft sign-in itself (no credential access
+    /// needed for that part) and hands the resulting token here to be
+    /// verified and persisted. Same `manual_*`/`(bool, String)` shape.
+    fn add_oauth_account(
+        &self,
+        display_name: &str,
+        email: &str,
+        username: &str,
+        access_token: &str,
+        refresh_token: &str,
+        expires_at: i64,
+        manual_imap_host: &str,
+        manual_imap_port: u16,
+        manual_imap_implicit_tls: bool,
+        manual_smtp_host: &str,
+        manual_smtp_port: u16,
+        manual_smtp_implicit_tls: bool,
+    ) -> zbus::Result<(bool, String)>;
+
     fn has_account(&self) -> zbus::Result<bool>;
 
-    /// `(has_account, id, email, display_name)` for the first
-    /// configured account — still single-account in behavior (see
-    /// `candor-daemon`'s own doc comment on this method). `list_accounts`
-    /// below is the real multi-account replacement, not yet called from
-    /// anywhere in this still-single-account GUI.
-    fn account_summary(&self) -> zbus::Result<(bool, String, String, String)>;
-
     /// Every configured account, as parallel vectors: `(ids, emails,
-    /// display_names, locked, tab_orders, colors, short_names,
+    /// display_names, locked, muted, tab_orders, colors, short_names,
     /// is_defaults)`. `colors` are `TabColor` variant names
-    /// (`"Blue"`/`"Green"`/etc.) as plain strings. Not yet called from
-    /// anywhere — added so the daemon side of Group 7 is complete ahead
-    /// of the GUI's tab UI, which will be what actually uses this.
+    /// (`"Blue"`/`"Green"`/etc.) as plain strings. What the top-level
+    /// `App` calls at startup to decide which `AccountTab`s to create.
     #[allow(clippy::type_complexity)]
     fn list_accounts(
         &self,
-    ) -> zbus::Result<(Vec<String>, Vec<String>, Vec<String>, Vec<bool>, Vec<u32>, Vec<String>, Vec<String>, Vec<bool>)>;
+    ) -> zbus::Result<(
+        Vec<String>,
+        Vec<String>,
+        Vec<String>,
+        Vec<bool>,
+        Vec<bool>,
+        Vec<u32>,
+        Vec<String>,
+        Vec<String>,
+        Vec<bool>,
+    )>;
 
     /// Flips one account's send lock — the only place this is ever
-    /// allowed to change (see `candor_group7_multiaccount_plan` in
-    /// memory: never automatically, never on a timer, only this
-    /// explicit call from a deliberate click). `false` if no account
-    /// with that id is configured. Not yet called from anywhere.
+    /// allowed to change: never automatically, never on a timer, only
+    /// this explicit call from a deliberate click.
     fn set_account_locked(&self, account_id: &str, locked: bool) -> zbus::Result<bool>;
 
-    /// Returns `false` if there was no account to remove.
-    fn remove_account(&self) -> zbus::Result<bool>;
+    /// Flips one account's notification mute — same reasoning as
+    /// `set_account_locked`, for `AccountConfig::muted` instead.
+    fn set_account_muted(&self, account_id: &str, muted: bool) -> zbus::Result<bool>;
+
+    /// Returns `false` if no account with that id is configured.
+    fn remove_account(&self, account_id: &str) -> zbus::Result<bool>;
 
     /// `(synced, new_or_updated_count)` — `synced` is false if
     /// `account_id` doesn't match a configured account.

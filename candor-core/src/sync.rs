@@ -16,9 +16,11 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use mail_parser::MessageParser;
 use native_tls::TlsStream;
+use zeroize::Zeroizing;
 
 use crate::body;
-use crate::config::{AccountConfig, Security};
+use crate::config::{AccountConfig, AuthMethod, Security};
+use crate::oauth;
 use crate::store::{self, FolderState, NewMessage};
 
 const INBOX: &str = "INBOX";
@@ -68,7 +70,7 @@ pub struct NewMailSummary {
 
 /// One-shot connect, sync every folder, disconnect. Used for a manual
 /// trigger. Returns `(folder, report)` for each folder synced.
-pub async fn sync_all(account: AccountConfig, password: String) -> Result<Vec<(String, SyncReport)>> {
+pub async fn sync_all(account: AccountConfig, password: Zeroizing<String>) -> Result<Vec<(String, SyncReport)>> {
     tokio::task::spawn_blocking(move || {
         let mut session = connect_and_login(&account, &password)?;
         let reports = sync_all_folders(&mut session, &account)?;
@@ -86,7 +88,7 @@ pub async fn sync_all(account: AccountConfig, password: String) -> Result<Vec<(S
 /// folder's sync too — fine for an explicit "Sync now", but needless
 /// latency when only one folder's change is actually what someone's
 /// waiting to see.
-pub async fn sync_one_folder(account: AccountConfig, password: String, folder: String) -> Result<SyncReport> {
+pub async fn sync_one_folder(account: AccountConfig, password: Zeroizing<String>, folder: String) -> Result<SyncReport> {
     tokio::task::spawn_blocking(move || {
         let mut session = connect_and_login(&account, &password)?;
         // `None` here is fine, not a loss of the folder's SPECIAL-USE
@@ -109,12 +111,28 @@ pub async fn sync_one_folder(account: AccountConfig, password: String, folder: S
 /// notification); `run` itself knows nothing about D-Bus or
 /// notifications, same reasoning as every other candor-core/candor-
 /// daemon split in this codebase.
-pub async fn run(account: AccountConfig, password: String, new_mail_tx: tokio::sync::mpsc::UnboundedSender<Vec<NewMailSummary>>) {
+/// Resolves its own credential fresh on every reconnect — deliberately
+/// not handed one by the caller, since this loop can run for the
+/// lifetime of the daemon process while an OAuth2 access token is only
+/// good for about an hour. `oauth::resolve_credential` refreshes it
+/// when needed and caches the result in the keyring, so most calls here
+/// are cheap; only an actual refresh (near-hourly, for an OAuth2
+/// account) does real network work.
+pub async fn run(account: AccountConfig, new_mail_tx: tokio::sync::mpsc::UnboundedSender<Vec<NewMailSummary>>) {
     let mut backoff = Duration::from_secs(5);
     loop {
         let acc = account.clone();
-        let pw = password.clone();
         let tx = new_mail_tx.clone();
+
+        let pw = match oauth::resolve_credential(&acc) {
+            Ok(pw) => pw,
+            Err(e) => {
+                tracing::warn!(error = %e, account = %acc.id, "could not resolve credential, retrying");
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(Duration::from_secs(300));
+                continue;
+            }
+        };
 
         let result = tokio::task::spawn_blocking(move || run_blocking(&acc, &pw, &tx)).await;
 
@@ -197,7 +215,11 @@ fn idle_timeout() -> Duration {
 /// from the GUI's side — it only ever writes locally; this is the
 /// unhurried background piece that actually tells the server, on
 /// whatever cadence `candor-daemon`'s background task calls it on.
-pub async fn push_pending_flags(account: AccountConfig, password: String) -> Result<()> {
+/// Resolves its own credential fresh each call, same reasoning as
+/// `run`'s doc comment — this is invoked repeatedly, on an interval,
+/// for as long as the daemon runs.
+pub async fn push_pending_flags(account: AccountConfig) -> Result<()> {
+    let password = oauth::resolve_credential(&account).context("resolving credential")?;
     tokio::task::spawn_blocking(move || push_pending_flags_blocking(&account, &password))
         .await
         .context("pending-flag push task panicked")?
@@ -275,7 +297,7 @@ fn push_pending_flags_blocking(account: &AccountConfig, password: &str) -> Resul
 /// found/updated.
 pub async fn search_server(
     account: AccountConfig,
-    password: String,
+    password: Zeroizing<String>,
     folder: Option<String>,
     query: String,
 ) -> Result<u32> {
@@ -359,7 +381,9 @@ fn search_server_blocking(
 /// framing as `push_pending_flags`: these already vanished from the
 /// GUI's view the moment they were queued, so there's no user waiting
 /// on this to finish.
-pub async fn push_pending_moves(account: AccountConfig, password: String) -> Result<()> {
+/// Same reasoning as `push_pending_flags` — resolves fresh each call.
+pub async fn push_pending_moves(account: AccountConfig) -> Result<()> {
+    let password = oauth::resolve_credential(&account).context("resolving credential")?;
     tokio::task::spawn_blocking(move || push_pending_moves_blocking(&account, &password))
         .await
         .context("pending-move push task panicked")?
@@ -421,7 +445,11 @@ fn push_pending_moves_blocking(account: &AccountConfig, password: &str) -> Resul
     Ok(())
 }
 
-pub(crate) fn connect_and_login(account: &AccountConfig, password: &str) -> Result<ImapSession> {
+/// `secret` is whatever `oauth::resolve_credential` returned for this
+/// account — a plain password for `AuthMethod::Password`, or a live
+/// Microsoft access token for `AuthMethod::OAuthMicrosoft`. Which one it
+/// is, and so which SASL mechanism to use, comes from `account` itself.
+pub(crate) fn connect_and_login(account: &AccountConfig, secret: &str) -> Result<ImapSession> {
     let tls = native_tls::TlsConnector::builder()
         .build()
         .context("building TLS connector")?;
@@ -441,9 +469,20 @@ pub(crate) fn connect_and_login(account: &AccountConfig, password: &str) -> Resu
         .map_err(|e| anyhow::anyhow!("IMAP STARTTLS connect failed: {e}"))?,
     };
 
-    client
-        .login(&account.username, password)
-        .map_err(|(e, _client)| anyhow::anyhow!("IMAP login failed: {e}"))
+    match account.auth_method {
+        AuthMethod::Password => client
+            .login(&account.username, secret)
+            .map_err(|(e, _client)| anyhow::anyhow!("IMAP login failed: {e}")),
+        AuthMethod::OAuthMicrosoft => {
+            let auth = crate::oauth::XOAuth2 {
+                user: account.username.clone(),
+                access_token: Zeroizing::new(secret.to_string()),
+            };
+            client
+                .authenticate("XOAUTH2", &auth)
+                .map_err(|(e, _client)| anyhow::anyhow!("IMAP XOAUTH2 failed: {e}"))
+        }
+    }
 }
 
 /// Lists every selectable folder (skips `\Noselect` entries, e.g. pure
@@ -641,6 +680,19 @@ fn sync_once(
         // the GUI's own top-`MESSAGE_LIST_LIMIT` view in the process.
         let gone: Vec<u32> = recent_uids.into_iter().filter(|uid| !returned_uids.contains(uid)).collect();
         if !gone.is_empty() {
+            // A message confirmed gone from the server is gone for
+            // real, regardless of why it left or whether it was ever
+            // marked exempt (starred/sent) for permanent search
+            // caching — that exemption is a promise about a message
+            // that still exists, not about outliving the message
+            // itself. Purge both caches before dropping the index row
+            // (message_id_for needs that row to still be there).
+            for &uid in &gone {
+                if let Ok(Some((message_id, _))) = store::message_id_for(&db, &account.id, folder, uid) {
+                    let _ = store::purge_message_body(&db, &account.id, &message_id);
+                }
+                let _ = body::purge_cached_message(&account.id, folder, uid);
+            }
             store::delete_messages(&db, &account.id, folder, &gone)?;
         }
     }

@@ -16,6 +16,7 @@ lettre = { version = "0.11.23", default-features = false, features = ["tokio1", 
 mail-auth = "0.13.3"
 mail-parser = { version = "0.11.9", features = ["full_encoding"] }
 native-tls = "0.2.18"
+oauth2 = { version = "5.0.0", default-features = false }
 quick-xml = { version = "0.42.0", features = ["serialize"] }
 regex = "1.13.1"
 rusqlite = { version = "0.40.2", features = ["bundled"] }

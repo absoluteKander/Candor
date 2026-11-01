@@ -94,11 +94,20 @@ static WELL_KNOWN: &[WellKnownProvider] = &[
         smtp_security: Security::ImplicitTls,
     },
     WellKnownProvider {
+        // Per Microsoft's own current consumer help page (verified
+        // 2026-10-31): the SMTP host for a personal Outlook.com/
+        // Hotmail/Live/MSN account is `smtp-mail.outlook.com`, NOT
+        // `smtp.office365.com` — that one's the Microsoft 365
+        // organizational (work/school) endpoint. Using the wrong one
+        // here was a real, live-discovered bug: IMAP against
+        // `outlook.office365.com` succeeded, but SMTP against the
+        // org-tenant hostname produced a confusing auth rejection
+        // for a genuine personal account.
         domains: &["outlook.com", "hotmail.com", "live.com", "msn.com"],
         imap_host: "outlook.office365.com",
         imap_port: 993,
         imap_security: Security::ImplicitTls,
-        smtp_host: "smtp.office365.com",
+        smtp_host: "smtp-mail.outlook.com",
         smtp_port: 587,
         smtp_security: Security::StartTls,
     },

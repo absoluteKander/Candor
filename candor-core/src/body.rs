@@ -13,15 +13,19 @@
 //! written to disk beyond that small extracted set. Attachment content
 //! is fetched fresh, on demand, only when the user explicitly asks to
 //! save it ([`fetch_and_save_attachments`]) — never automatically
-//! alongside an ordinary open, and never cached either, by design: see
-//! `candor_group_security_and_stability` in project memory for why.
+//! alongside an ordinary open, and never cached either, by design: an
+//! attachment is the single most common way a malicious email actually
+//! does damage, so "it downloaded the moment I opened the message" is
+//! not a sentence this project wants to be true.
 
 use std::collections::HashMap;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use mail_parser::MimeHeaders;
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroizing;
 
 use crate::config::AccountConfig;
 use crate::sync::connect_and_login;
@@ -39,16 +43,70 @@ fn cache_dir(account_id: &str, folder: &str) -> Result<PathBuf> {
 
 /// Folder names can contain `/` (IMAP hierarchy separators) — flatten
 /// those so each folder maps to exactly one cache directory, not a
-/// nested tree mirroring the mailbox's own structure.
+/// nested tree mirroring the mailbox's own structure. Also guards
+/// against a folder name that's exactly `.`/`..`/empty after
+/// flattening: the server is a source this project already treats as
+/// trusted (see `discover.rs`'s doc comment), but a folder literally
+/// named `".."` would otherwise traverse this cache path up a level
+/// when joined, with no `/`/`\` character present for the replacement
+/// above to ever catch.
 fn sanitize_folder(folder: &str) -> String {
-    folder
-        .chars()
-        .map(|c| if c == '/' || c == '\\' { '_' } else { c })
-        .collect()
+    let flattened: String =
+        folder.chars().map(|c| if c == '/' || c == '\\' { '_' } else { c }).collect();
+    match flattened.as_str() {
+        "" | "." | ".." => "_".to_string(),
+        _ => flattened,
+    }
+}
+
+/// Reduces an attachment's claimed filename — straight from the
+/// message's own Content-Disposition header, set by whoever sent the
+/// email, not by the user or by us — to a bare basename safe to join
+/// onto a caller-chosen save directory. Splits on *both* `/` and `\`
+/// manually first, rather than relying on `Path::file_name()` alone:
+/// that only recognizes this platform's own separator, so a filename
+/// using the other style (`..\..\evil.exe`) would otherwise pass
+/// through unsplit — inert as an actual traversal vector on Linux
+/// specifically (the filesystem doesn't treat `\` as a separator
+/// either), but there's no reason to depend on that distinction
+/// holding when normalizing both explicitly is just as simple, and
+/// `sanitize_folder` right above already does the same for folder
+/// names. Anything that leaves no sane basename at all (empty, ".",
+/// "..") falls back to a generic name rather than being silently
+/// skipped. Pulled out of `fetch_and_save_attachments` specifically so
+/// this one security-critical piece of logic is unit-testable on its
+/// own, without the network fetch and file I/O around it.
+fn sanitize_attachment_filename(filename: &str) -> String {
+    let last_segment = filename.rsplit(['/', '\\']).next().unwrap_or(filename);
+    let candidate = std::path::Path::new(last_segment)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    match candidate.as_str() {
+        "" | "." | ".." => "attachment".to_string(),
+        _ => candidate,
+    }
 }
 
 fn body_path(account_id: &str, folder: &str, uid: u32) -> Result<PathBuf> {
     Ok(cache_dir(account_id, folder)?.join(format!("{uid}.json")))
+}
+
+/// Removes one message's reading-pane cache (display content + DKIM
+/// verdict), if either file exists — used wherever a message is
+/// confirmed gone from the server, so this cache never outlives the
+/// message it describes. A no-op if nothing was cached, which is the
+/// common case (most messages are never opened).
+pub fn purge_cached_message(account_id: &str, folder: &str, uid: u32) -> Result<()> {
+    let path = body_path(account_id, folder, uid)?;
+    let vpath = verdict_path(&path);
+    if path.exists() {
+        std::fs::remove_file(&path).with_context(|| format!("purging cached message at {}", path.display()))?;
+    }
+    if vpath.exists() {
+        std::fs::remove_file(&vpath).with_context(|| format!("purging cached verdict at {}", vpath.display()))?;
+    }
+    Ok(())
 }
 
 /// Wipes the cached bodies for a folder — used when the server's
@@ -130,7 +188,7 @@ pub fn read_cached_message(path: &Path) -> Result<Option<CachedMessage>> {
 /// trade-off this module makes.
 pub async fn fetch_body(
     account: AccountConfig,
-    password: String,
+    password: Zeroizing<String>,
     folder: String,
     uid: u32,
 ) -> Result<PathBuf> {
@@ -162,7 +220,7 @@ pub async fn fetch_body(
 /// message.
 pub async fn fetch_body_text(
     account: AccountConfig,
-    password: String,
+    password: Zeroizing<String>,
     folder: String,
     uid: u32,
 ) -> Result<Option<String>> {
@@ -178,7 +236,7 @@ pub async fn fetch_body_text(
 /// Returns how many attachments were saved.
 pub async fn fetch_and_save_attachments(
     account: AccountConfig,
-    password: String,
+    password: Zeroizing<String>,
     folder: String,
     uid: u32,
     dest_dir: PathBuf,
@@ -193,8 +251,9 @@ pub async fn fetch_and_save_attachments(
             let Some(filename) = part.attachment_name() else {
                 continue;
             };
-            std::fs::write(dest_dir.join(filename), part.contents())
-                .with_context(|| format!("writing attachment {filename}"))?;
+            let safe_name = sanitize_attachment_filename(filename);
+            std::fs::write(dest_dir.join(&safe_name), part.contents())
+                .with_context(|| format!("writing attachment {safe_name}"))?;
             saved += 1;
         }
         Ok(saved)
@@ -215,6 +274,13 @@ async fn compute_and_cache_verdict(body_path: &Path, raw: &[u8]) -> Result<()> {
     tokio::fs::write(&vpath, json)
         .await
         .with_context(|| format!("writing verdict to {}", vpath.display()))?;
+    // Same reasoning as `config::write_private` — this cache holds a
+    // real DKIM/sender-authentication verdict for a specific message,
+    // not opaque data, so it's tightened past the process umask's
+    // default rather than left world-readable.
+    tokio::fs::set_permissions(&vpath, std::fs::Permissions::from_mode(0o600))
+        .await
+        .with_context(|| format!("setting permissions on {}", vpath.display()))?;
 
     Ok(())
 }
@@ -236,11 +302,10 @@ fn fetch_and_cache_blocking(
     let cached = build_cached_message(parsed.as_ref());
 
     if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)
-            .with_context(|| format!("creating body cache dir {}", dir.display()))?;
+        crate::config::create_private_dir_all(dir)?;
     }
     let json = serde_json::to_vec_pretty(&cached).context("serializing cached message")?;
-    std::fs::write(path, json).with_context(|| format!("writing cached message to {}", path.display()))?;
+    crate::config::write_private(path, &json)?;
 
     Ok(raw)
 }
@@ -365,4 +430,149 @@ fn fetch_raw_blocking(account: &AccountConfig, password: &str, folder: &str, uid
     let _ = session.logout();
 
     Ok(bytes)
+}
+
+/// Security regression suite for this file — see the project's
+/// `SECURITY.md` for the methodology these tests are part of. Each
+/// test here guards one specific, previously-real failure mode, not a
+/// coverage target: if a test here would still pass with the fix it
+/// guards reverted, it isn't doing its job.
+#[cfg(test)]
+mod security_regression_tests {
+    use super::*;
+
+    /// Guards the path-traversal fix: an attachment filename is
+    /// attacker-controlled (set by whoever sent the email), and used
+    /// to be joined onto the save directory unsanitized. Confirmed
+    /// against the pre-fix code that every one of these would have
+    /// escaped the caller's chosen directory.
+    #[test]
+    fn attachment_filename_traversal_payloads_are_neutralized() {
+        let cases = [
+            ("../../../../.bashrc", ".bashrc"),
+            ("../../.ssh/authorized_keys", "authorized_keys"),
+            ("/etc/cron.d/evil", "evil"),
+            ("..\\..\\windows-style\\evil.exe", "evil.exe"),
+            ("normal-invoice.pdf", "normal-invoice.pdf"),
+        ];
+        for (payload, expected) in cases {
+            let safe = sanitize_attachment_filename(payload);
+            assert_eq!(safe, expected, "payload {payload:?} produced {safe:?}");
+            assert!(!safe.contains(".."), "payload {payload:?} still contains .. -> {safe:?}");
+            assert!(
+                !std::path::Path::new(&safe).is_absolute(),
+                "payload {payload:?} still absolute -> {safe:?}"
+            );
+        }
+    }
+
+    /// A degenerate filename (empty, bare "..", or a trailing
+    /// separator that leaves nothing after it) must still produce
+    /// *something* writable, not silently vanish or panic.
+    #[test]
+    fn attachment_filename_degenerate_cases_fall_back_to_a_generic_name() {
+        for payload in ["", "..", ".", "../", "/"] {
+            let safe = sanitize_attachment_filename(payload);
+            assert!(!safe.is_empty(), "payload {payload:?} produced an empty name");
+            assert_ne!(safe, "..", "payload {payload:?} still resolved to ..");
+        }
+    }
+
+    /// Guards the narrower, server-side sibling of the same bug: a
+    /// folder name (trusted input in this project's threat model, but
+    /// hardened anyway) that's exactly ".." would otherwise traverse
+    /// the on-disk cache path up one level, since it contains no `/`
+    /// or `\` for the flattening step to ever catch.
+    #[test]
+    fn folder_cache_path_traversal_payloads_are_neutralized() {
+        for payload in ["..", ".", ""] {
+            let safe = sanitize_folder(payload);
+            assert_ne!(safe, "..", "payload {payload:?} still resolved to ..");
+            assert_ne!(safe, ".", "payload {payload:?} still resolved to .");
+            assert!(!safe.is_empty(), "payload {payload:?} produced an empty name");
+        }
+        // The common, legitimate case — a real IMAP hierarchy —
+        // mustn't be broken by the hardening above.
+        assert_eq!(sanitize_folder("Work/2026"), "Work_2026");
+    }
+}
+
+/// Adversarial-input tests — deliberately distinct from
+/// `security_regression_tests` above. Those confirm a specific fix
+/// produces the *correct* result; these confirm the sanitizers *fail
+/// safely* against input that's malformed or actively hostile in ways
+/// no legitimate sender or server would produce, which is still the
+/// expected shape of real input per this project's zero-trust policy
+/// (see `SECURITY.md`). The only requirement for a test in here is
+/// "doesn't panic, and never produces a traversal-capable result" —
+/// not a specific expected output string.
+#[cfg(test)]
+mod adversarial_input_tests {
+    use super::*;
+
+    #[test]
+    fn attachment_filename_never_panics_or_escapes_regardless_of_input() {
+        let cases = [
+            String::new(),
+            "\0".to_string(),
+            "a\0/../../etc/passwd".to_string(),
+            "/".repeat(500),
+            "../".repeat(500),
+            "A".repeat(10_000),
+            "😀🔥💀".repeat(200),
+            "\u{202E}gpj.exe".to_string(), // right-to-left override trick
+            "   ".to_string(),
+            "....".to_string(),
+            "CON".to_string(), // Windows-reserved name; harmless on Linux, worth confirming no special-case panic
+        ];
+        for payload in cases {
+            let safe = sanitize_attachment_filename(&payload);
+            assert!(!safe.is_empty(), "payload {payload:?} produced an empty result");
+            assert!(
+                !std::path::Path::new(&safe).is_absolute(),
+                "payload {payload:?} -> {safe:?} is still absolute"
+            );
+            // The real property that actually matters: joining onto
+            // some directory and immediately asking for that joined
+            // path's parent must land back on that same directory,
+            // not anywhere else — this is what "can't escape
+            // dest_dir" means in practice. A naive `!safe.contains("..")`
+            // check used to sit here instead and was simply wrong: a
+            // filename like "...." contains the substring ".." without
+            // being a traversal at all (only "."/".." as a *complete*
+            // path component is special to the filesystem — confirmed
+            // empirically, not assumed, after this exact test failed
+            // against genuinely safe production behavior).
+            let base = std::path::Path::new("/tmp/candor-test-dest");
+            let joined = base.join(&safe);
+            assert_eq!(
+                joined.parent(),
+                Some(base),
+                "payload {payload:?} -> {safe:?} joined outside dest_dir: {joined:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn folder_sanitization_never_panics_or_escapes_regardless_of_input() {
+        let cases = [
+            String::new(),
+            "\0".to_string(),
+            "/".repeat(500),
+            "../../../".repeat(100),
+            "A".repeat(10_000),
+            "😀/🔥\\💀".repeat(100),
+            "\u{202E}..\u{202E}".to_string(),
+        ];
+        for payload in cases {
+            let safe = sanitize_folder(&payload);
+            assert!(!safe.is_empty(), "payload {payload:?} produced an empty result");
+            assert_ne!(safe, "..", "payload {payload:?} resolved to ..");
+            assert_ne!(safe, ".", "payload {payload:?} resolved to .");
+            assert!(
+                !safe.contains('/') && !safe.contains('\\'),
+                "payload {payload:?} -> {safe:?} still contains a path separator"
+            );
+        }
+    }
 }

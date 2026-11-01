@@ -116,6 +116,72 @@ const STATIC_CSS: &str = "
     background-color: @accent_bg_color;
     color: @accent_fg_color;
 }
+
+/* The bespoke tab strip (`tab_strip_row.rs`) that replaces `AdwTabBar`
+   — a custom widget, since the per-account lock/mute icons and the
+   always-visible fixed order don't fit a generic tab bar's own model.
+   `TabColor`'s 8 presets as named tokens, not literal hex baked
+   into the widget's own CSS classes, same reasoning as `@accent_bg_color`
+   above: a future `apply()` override (if Omarchy ever exposes more than
+   one accent) has something to redefine instead of a hunt through Rust
+   code for hardcoded colors. Picked one medium-saturation value per hue
+   that reads acceptably on both light and dark Adwaita, same pragmatic
+   choice this file already makes for `.kb-focused`/`.unread-bar` above
+   rather than hand-tuning per color scheme. */
+@define-color candor_tab_blue #3584e4;
+@define-color candor_tab_green #2ec27e;
+@define-color candor_tab_purple #9141ac;
+@define-color candor_tab_orange #ff7800;
+@define-color candor_tab_red #e01b24;
+@define-color candor_tab_teal #2190a4;
+@define-color candor_tab_pink #e66ce6;
+@define-color candor_tab_yellow #c4a000;
+
+.candor-tab-strip {
+    padding: 4px 4px 0 4px;
+}
+.candor-tab-strip-row {
+    padding: 6px 10px;
+    border-radius: 10px 10px 0 0;
+}
+.candor-tab-strip-row:hover {
+    background-color: alpha(currentColor, 0.06);
+}
+.candor-tab-strip-row.selected {
+    background-color: alpha(@accent_bg_color, 0.18);
+}
+.candor-tab-color-dot {
+    min-width: 10px;
+    min-height: 10px;
+    border-radius: 50%;
+}
+.candor-tab-color-dot.candor-color-blue   { background-color: @candor_tab_blue; }
+.candor-tab-color-dot.candor-color-green  { background-color: @candor_tab_green; }
+.candor-tab-color-dot.candor-color-purple { background-color: @candor_tab_purple; }
+.candor-tab-color-dot.candor-color-orange { background-color: @candor_tab_orange; }
+.candor-tab-color-dot.candor-color-red    { background-color: @candor_tab_red; }
+.candor-tab-color-dot.candor-color-teal   { background-color: @candor_tab_teal; }
+.candor-tab-color-dot.candor-color-pink   { background-color: @candor_tab_pink; }
+.candor-tab-color-dot.candor-color-yellow { background-color: @candor_tab_yellow; }
+
+.candor-lock-btn.locked {
+    color: @candor_tab_red;
+}
+.candor-lock-btn.unlocked {
+    color: @candor_tab_green;
+}
+
+@keyframes candor-notify-pulse {
+    0%, 100% { opacity: 0.3; }
+    50% { opacity: 1.0; }
+}
+.candor-notify-btn.has-mail {
+    color: @candor_tab_yellow;
+    animation: candor-notify-pulse 1.6s ease-in-out infinite;
+}
+.candor-notify-btn.muted {
+    opacity: 0.3;
+}
 ";
 
 /// Call once at startup, after `adw::init()` (relm4 does this itself when
@@ -159,3 +225,4 @@ pub fn apply_and_watch() {
     // explicit leak is simpler than threading a owner through AppModel.
     std::mem::forget(monitor);
 }
+

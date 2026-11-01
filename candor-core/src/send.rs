@@ -8,10 +8,11 @@ use std::path::PathBuf;
 
 use anyhow::{bail, Context, Result};
 use lettre::message::{Attachment, Mailbox, Mailboxes, MultiPart, SinglePart};
-use lettre::transport::smtp::authentication::Credentials;
+use lettre::transport::smtp::authentication::{Credentials, Mechanism};
 use lettre::{AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
+use zeroize::Zeroizing;
 
-use crate::config::{AccountConfig, Security};
+use crate::config::{AccountConfig, AuthMethod, Security};
 use crate::sync::connect_and_login;
 
 pub struct OutgoingMessage {
@@ -45,7 +46,15 @@ pub struct OutgoingMessage {
 /// without one, but a draft is allowed to sit there half-finished with
 /// no "To" filled in yet.
 async fn build_message(account: &AccountConfig, msg: OutgoingMessage, require_recipient: bool) -> Result<Message> {
-    let from: Mailbox = account.email.parse().context("invalid From address in account config")?;
+    let bare_from: Mailbox = account.email.parse().context("invalid From address in account config")?;
+    // Attach the account's own display name to the From header (e.g.
+    // "Jane Doe <you@gmail.com>") so recipients see a name, not
+    // a bare address — `display_name` was captured at account-setup
+    // time but never actually used for this until now. Empty is left
+    // as no name at all, same as before this existed, rather than
+    // showing an empty `"" <you@gmail.com>`.
+    let name = (!account.display_name.trim().is_empty()).then(|| account.display_name.clone());
+    let from = Mailbox::new(name, bare_from.email);
 
     let mut builder = Message::builder()
         .from(from.clone())
@@ -108,15 +117,22 @@ async fn build_message(account: &AccountConfig, msg: OutgoingMessage, require_re
     }
 }
 
-pub async fn send(account: &AccountConfig, password: &str, msg: OutgoingMessage) -> Result<()> {
+/// `secret` is whatever `oauth::resolve_credential` returned for this
+/// account — a plain password for `AuthMethod::Password`, or a live
+/// Microsoft access token for `AuthMethod::OAuthMicrosoft`.
+pub async fn send(account: &AccountConfig, secret: &str, msg: OutgoingMessage) -> Result<()> {
     let email = build_message(account, msg, true).await?;
 
-    let creds = Credentials::new(account.username.clone(), password.to_string());
-    let transport_builder = match account.smtp_security {
+    let creds = Credentials::new(account.username.clone(), secret.to_string());
+    let mut transport_builder = match account.smtp_security {
         Security::ImplicitTls => AsyncSmtpTransport::<Tokio1Executor>::relay(&account.smtp_host),
         Security::StartTls => AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(&account.smtp_host),
     }
     .with_context(|| format!("building SMTP transport for {}", account.smtp_host))?;
+
+    if account.auth_method == AuthMethod::OAuthMicrosoft {
+        transport_builder = transport_builder.authentication(vec![Mechanism::Xoauth2]);
+    }
 
     let transport: AsyncSmtpTransport<Tokio1Executor> =
         transport_builder.port(account.smtp_port).credentials(creds).build();
@@ -137,7 +153,7 @@ pub async fn save_draft(account: &AccountConfig, password: &str, drafts_folder: 
     let bytes = email.formatted();
 
     let account = account.clone();
-    let password = password.to_string();
+    let password = Zeroizing::new(password.to_string());
     let drafts_folder = drafts_folder.to_string();
     tokio::task::spawn_blocking(move || {
         let mut session = connect_and_login(&account, &password)?;

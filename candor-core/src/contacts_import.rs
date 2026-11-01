@@ -1,11 +1,12 @@
 //! Parses a contacts CSV exported from some other address book (Google
 //! Contacts, Nextcloud, Outlook, ...) into `(name, address)` pairs ready
 //! for `store::upsert_contact`. Deliberately not a full vCard/CardDAV
-//! client — see `candor_group6_contacts_plan` in memory for why a
-//! one-time CSV import was chosen over live contacts sync. Real
-//! exports vary wildly in column naming (Google's is literally
-//! `E-mail 1 - Value`), so this matches headers loosely by substring
-//! rather than expecting one fixed schema.
+//! client — a one-time CSV import needs no ongoing account access or
+//! sync credentials from a separate contacts service, consistent with
+//! this app never connecting to anything beyond the mail server
+//! itself. Real exports vary wildly in column naming (Google's is
+//! literally `E-mail 1 - Value`), so this matches headers loosely by
+//! substring rather than expecting one fixed schema.
 
 use std::path::Path;
 

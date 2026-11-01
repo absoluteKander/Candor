@@ -3,8 +3,11 @@ mod notify;
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use candor_core::account::{self, AddAccountOutcome, ManualServerSettings, NewAccountRequest};
-use candor_core::config::{self, CredentialStore, Security};
+use candor_core::account::{
+    self, AddAccountOutcome, ManualServerSettings, NewAccountRequest, NewOAuthAccountRequest,
+};
+use candor_core::config::{self, Security};
+use candor_core::oauth;
 use candor_core::sync;
 use zbus::connection::Builder;
 use zbus::interface;
@@ -25,7 +28,7 @@ const PENDING_PUSH_INTERVAL: std::time::Duration = std::time::Duration::from_sec
 /// currently has focused — mail arrives at random times per account
 /// regardless of UI state, so background sync never pauses for an
 /// account just because its tab isn't the one being looked at right
-/// now (see `candor_group7_multiaccount_plan` in memory).
+/// now.
 struct AccountRuntime {
     sync_task: Option<tokio::task::JoinHandle<()>>,
     pending_push_task: Option<tokio::task::JoinHandle<()>>,
@@ -67,9 +70,14 @@ impl DaemonService {
     /// Built fully before taking the lock, so the lock is only ever
     /// held for the quick insert/replace, not for the duration of
     /// setting up three tasks.
-    fn start_account(&self, account: config::AccountConfig, password: String) {
+    /// Does not take a credential — `sync::run` and the pending-push
+    /// loop below both resolve their own, fresh, on every reconnect/
+    /// interval (see `sync::run`'s doc comment for why: these run for
+    /// the daemon's whole lifetime, far longer than an OAuth2 access
+    /// token is valid for).
+    fn start_account(&self, account: config::AccountConfig) {
         let (new_mail_tx, mut new_mail_rx) = tokio::sync::mpsc::unbounded_channel();
-        let sync_task = tokio::spawn(sync::run(account.clone(), password.clone(), new_mail_tx));
+        let sync_task = tokio::spawn(sync::run(account.clone(), new_mail_tx));
         let notify_task = tokio::spawn(async move {
             while let Some(mail) = new_mail_rx.recv().await {
                 if let Err(e) = notify::send_new_mail_notification(&mail).await {
@@ -79,14 +87,13 @@ impl DaemonService {
         });
 
         let push_account = account.clone();
-        let push_password = password.clone();
         let pending_push_task = tokio::spawn(async move {
             loop {
                 tokio::time::sleep(PENDING_PUSH_INTERVAL).await;
-                if let Err(e) = sync::push_pending_flags(push_account.clone(), push_password.clone()).await {
+                if let Err(e) = sync::push_pending_flags(push_account.clone()).await {
                     tracing::warn!(error = %e, account = %push_account.id, "failed to push queued flag changes");
                 }
-                if let Err(e) = sync::push_pending_moves(push_account.clone(), push_password.clone()).await {
+                if let Err(e) = sync::push_pending_moves(push_account.clone()).await {
                     tracing::warn!(error = %e, account = %push_account.id, "failed to push queued moves");
                 }
                 // Purely local (see `store::wake_due_snoozes`'s doc
@@ -99,7 +106,7 @@ impl DaemonService {
                     Ok(n) => tracing::info!(account = %push_account.id, count = n, "woke due snoozes"),
                     Err(e) => tracing::warn!(error = %e, "failed to check due snoozes"),
                 }
-                if let Err(e) = fill_pending_body_cache(&push_account, &push_password).await {
+                if let Err(e) = fill_pending_body_cache(&push_account).await {
                     tracing::warn!(error = %e, "failed to fill pending body cache");
                 }
                 if let Err(e) = run_retention_sweep(&push_account.id) {
@@ -192,12 +199,10 @@ impl DaemonService {
         match account::add_account(req).await {
             Ok(AddAccountOutcome::Added(acc)) => {
                 tracing::info!(account = %acc.id, "account added");
-                match CredentialStore::get_password(&acc.id) {
-                    Ok(password) => self.start_account(acc.clone(), password),
-                    Err(e) => {
-                        tracing::warn!(error = %e, "could not read back credential to start sync")
-                    }
+                if let Err(e) = oauth::resolve_credential(&acc) {
+                    tracing::warn!(error = %e, account = %acc.id, "could not read back credential right after adding");
                 }
+                self.start_account(acc.clone());
                 Ok((true, acc.id))
             }
             Ok(AddAccountOutcome::NeedsManualSettings) => {
@@ -211,41 +216,106 @@ impl DaemonService {
         }
     }
 
+    /// Adds a new account authenticating via Microsoft OAuth2 instead
+    /// of a password — the GUI runs the actual interactive sign-in
+    /// itself (opening the browser, catching the redirect; see
+    /// `candor_core::oauth::interactive_sign_in`, which needs no
+    /// credential access and so has no reason to go through the
+    /// daemon), then hands the resulting token here to be verified
+    /// against the real server and persisted, the same shape as
+    /// `add_account` does for a password. Same `manual_*` fallback
+    /// convention: empty `manual_imap_host` tries autodiscovery first.
+    async fn add_oauth_account(
+        &self,
+        display_name: String,
+        email: String,
+        username: String,
+        access_token: String,
+        refresh_token: String,
+        expires_at: i64,
+        manual_imap_host: String,
+        manual_imap_port: u16,
+        manual_imap_implicit_tls: bool,
+        manual_smtp_host: String,
+        manual_smtp_port: u16,
+        manual_smtp_implicit_tls: bool,
+    ) -> zbus::fdo::Result<(bool, String)> {
+        let manual = if manual_imap_host.is_empty() {
+            None
+        } else {
+            Some(ManualServerSettings {
+                imap_host: manual_imap_host,
+                imap_port: manual_imap_port,
+                imap_security: security_from_bool(manual_imap_implicit_tls),
+                smtp_host: manual_smtp_host,
+                smtp_port: manual_smtp_port,
+                smtp_security: security_from_bool(manual_smtp_implicit_tls),
+            })
+        };
+
+        let req = NewOAuthAccountRequest {
+            display_name,
+            email,
+            username,
+            access_token: Zeroizing::new(access_token),
+            refresh_token: Zeroizing::new(refresh_token),
+            expires_at,
+            manual,
+        };
+
+        match account::add_oauth_account(req).await {
+            Ok(AddAccountOutcome::Added(acc)) => {
+                tracing::info!(account = %acc.id, "OAuth account added");
+                if let Err(e) = oauth::resolve_credential(&acc) {
+                    tracing::warn!(error = %e, account = %acc.id, "could not read back credential right after adding");
+                }
+                self.start_account(acc.clone());
+                Ok((true, acc.id))
+            }
+            Ok(AddAccountOutcome::NeedsManualSettings) => {
+                tracing::info!("autodiscovery found nothing usable; manual settings needed");
+                Ok((false, String::new()))
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "add_oauth_account failed");
+                Err(zbus::fdo::Error::Failed(format!("{e:#}")))
+            }
+        }
+    }
+
     async fn has_account(&self) -> zbus::fdo::Result<bool> {
         let cfg = config::load().map_err(|e| zbus::fdo::Error::Failed(format!("{e:#}")))?;
         Ok(!cfg.accounts.is_empty())
     }
 
-    /// `(has_account, id, email, display_name)` for the first
-    /// configured account — the latter three are empty when
-    /// `has_account` is false. Kept, unchanged, for the current
-    /// single-account GUI; `list_accounts` below is the real
-    /// multi-account replacement, additive rather than a break, for
-    /// whenever the GUI's tab UI is built to use it.
-    async fn account_summary(&self) -> zbus::fdo::Result<(bool, String, String, String)> {
-        let accounts = account::list_accounts().map_err(|e| zbus::fdo::Error::Failed(format!("{e:#}")))?;
-        match accounts.into_iter().next() {
-            Some(acc) => Ok((true, acc.id, acc.email, acc.display_name)),
-            None => Ok((false, String::new(), String::new(), String::new())),
-        }
-    }
-
     /// Every configured account, as parallel vectors (D-Bus has no
     /// native "array of structs" that zbus's simple method-return
-    /// style reaches for) — `(id, email, display_name, locked,
-    /// tab_order, color, short_name, is_default)`. Not yet called from
-    /// anywhere (the GUI is still single-account), added now so the
-    /// daemon side of Group 7 is complete ahead of the GUI tab work
-    /// that will actually consume it.
+    /// style reaches for) — `(id, email, display_name, locked, muted,
+    /// tab_order, color, short_name, is_default)`. What the GUI's
+    /// top-level tab-bar startup enumeration calls to find out which
+    /// `AccountTab`s to create — the real multi-account replacement for
+    /// the old single-account `account_summary`, which is gone now that
+    /// something actually calls this instead.
+    #[allow(clippy::type_complexity)]
     async fn list_accounts(
         &self,
-    ) -> zbus::fdo::Result<(Vec<String>, Vec<String>, Vec<String>, Vec<bool>, Vec<u32>, Vec<String>, Vec<String>, Vec<bool>)>
-    {
+    ) -> zbus::fdo::Result<(
+        Vec<String>,
+        Vec<String>,
+        Vec<String>,
+        Vec<bool>,
+        Vec<bool>,
+        Vec<u32>,
+        Vec<String>,
+        Vec<String>,
+        Vec<bool>,
+    )> {
         let accounts = account::list_accounts().map_err(|e| zbus::fdo::Error::Failed(format!("{e:#}")))?;
         let mut ids = Vec::with_capacity(accounts.len());
         let mut emails = Vec::with_capacity(accounts.len());
         let mut display_names = Vec::with_capacity(accounts.len());
         let mut locked = Vec::with_capacity(accounts.len());
+        let mut muted = Vec::with_capacity(accounts.len());
         let mut tab_orders = Vec::with_capacity(accounts.len());
         let mut colors = Vec::with_capacity(accounts.len());
         let mut short_names = Vec::with_capacity(accounts.len());
@@ -255,19 +325,20 @@ impl DaemonService {
             emails.push(acc.email);
             display_names.push(acc.display_name);
             locked.push(acc.locked);
+            muted.push(acc.muted);
             tab_orders.push(acc.tab_order);
             colors.push(format!("{:?}", acc.color));
             short_names.push(acc.short_name);
             is_defaults.push(acc.is_default);
         }
-        Ok((ids, emails, display_names, locked, tab_orders, colors, short_names, is_defaults))
+        Ok((ids, emails, display_names, locked, muted, tab_orders, colors, short_names, is_defaults))
     }
 
     /// Flips one account's send lock — the only place this is ever
     /// allowed to change (never automatically, never on a timer, never
-    /// as a side effect of anything else). See `AccountConfig::locked`
-    /// and `candor_group7_multiaccount_plan` in memory. Returns
-    /// `false` if no account with that id is configured.
+    /// as a side effect of anything else). See `AccountConfig::locked`'s
+    /// own doc comment for the full reasoning. Returns `false` if no
+    /// account with that id is configured.
     async fn set_account_locked(&self, account_id: String, locked: bool) -> zbus::fdo::Result<bool> {
         let mut cfg = config::load().map_err(|e| zbus::fdo::Error::Failed(format!("{e:#}")))?;
         let Some(acc) = cfg.accounts.iter_mut().find(|a| a.id == account_id) else {
@@ -278,21 +349,29 @@ impl DaemonService {
         Ok(true)
     }
 
-    /// Removes the first configured account (credential + config) and
-    /// stops its background runtime. Returns `false` if there was no
-    /// account to remove. Still single-account in behavior like
-    /// `account_summary` above — a `remove_account` that takes an
-    /// explicit id is the natural next step once the GUI actually
-    /// needs to remove one of several.
-    async fn remove_account(&self) -> zbus::fdo::Result<bool> {
-        let accounts = account::list_accounts().map_err(|e| zbus::fdo::Error::Failed(format!("{e:#}")))?;
-        let Some(acc) = accounts.into_iter().next() else {
+    /// Flips one account's notification mute — same shape and same
+    /// "only this explicit call ever changes it" reasoning as
+    /// `set_account_locked`, for `AccountConfig::muted` instead. Returns
+    /// `false` if no account with that id is configured.
+    async fn set_account_muted(&self, account_id: String, muted: bool) -> zbus::fdo::Result<bool> {
+        let mut cfg = config::load().map_err(|e| zbus::fdo::Error::Failed(format!("{e:#}")))?;
+        let Some(acc) = cfg.accounts.iter_mut().find(|a| a.id == account_id) else {
             return Ok(false);
         };
-        let removed = account::remove_account(&acc.id)
+        acc.muted = muted;
+        config::save(&cfg).map_err(|e| zbus::fdo::Error::Failed(format!("{e:#}")))?;
+        Ok(true)
+    }
+
+    /// Removes one account (credential + config) and stops its
+    /// background runtime. Returns `false` if no account with that id
+    /// is configured — the real multi-account version, now that an
+    /// `AccountTab` closing its own account is a real caller.
+    async fn remove_account(&self, account_id: String) -> zbus::fdo::Result<bool> {
+        let removed = account::remove_account(&account_id)
             .map_err(|e| zbus::fdo::Error::Failed(format!("{e:#}")))?;
         if removed {
-            self.stop_account(&acc.id);
+            self.stop_account(&account_id);
         }
         Ok(removed)
     }
@@ -301,7 +380,7 @@ impl DaemonService {
     /// its background IDLE loop. Returns `(synced, new_or_updated_count)`.
     async fn sync_now(&self, account_id: String) -> zbus::fdo::Result<(bool, u32)> {
         let acc = resolve_account(&account_id)?;
-        let password = CredentialStore::get_password(&acc.id)
+        let password = oauth::resolve_credential(&acc)
             .map_err(|e| zbus::fdo::Error::Failed(format!("{e:#}")))?;
 
         let reports = sync::sync_all(acc, password)
@@ -317,7 +396,7 @@ impl DaemonService {
     /// current right now (see `sync::sync_one_folder`'s doc comment).
     async fn sync_folder(&self, account_id: String, folder: String) -> zbus::fdo::Result<(bool, u32)> {
         let acc = resolve_account(&account_id)?;
-        let password = CredentialStore::get_password(&acc.id)
+        let password = oauth::resolve_credential(&acc)
             .map_err(|e| zbus::fdo::Error::Failed(format!("{e:#}")))?;
 
         let report = sync::sync_one_folder(acc, password, folder)
@@ -335,7 +414,7 @@ impl DaemonService {
     /// small cached JSON.
     async fn fetch_body(&self, account_id: String, folder: String, uid: u32) -> zbus::fdo::Result<(bool, String)> {
         let acc = resolve_account(&account_id)?;
-        let password = CredentialStore::get_password(&acc.id)
+        let password = oauth::resolve_credential(&acc)
             .map_err(|e| zbus::fdo::Error::Failed(format!("{e:#}")))?;
 
         let path = candor_core::body::fetch_body(acc, password, folder, uid)
@@ -358,7 +437,7 @@ impl DaemonService {
         dest_dir: String,
     ) -> zbus::fdo::Result<(bool, u32)> {
         let acc = resolve_account(&account_id)?;
-        let password = CredentialStore::get_password(&acc.id)
+        let password = oauth::resolve_credential(&acc)
             .map_err(|e| zbus::fdo::Error::Failed(format!("{e:#}")))?;
 
         let saved = candor_core::body::fetch_and_save_attachments(
@@ -391,20 +470,21 @@ impl DaemonService {
         let acc = resolve_account(&account_id)?;
         let db = candor_core::store::open().map_err(|e| zbus::fdo::Error::Failed(format!("{e:#}")))?;
 
-        // Purge the cached body (if any) when the message is actually
-        // leaving the mailbox for good — Trash or Junk. Archive does
-        // NOT purge: on Gmail specifically, "archive" just removes the
-        // Inbox label (see `move_message_by_uid` in candor-gui, which
-        // already falls back to `\All` for exactly this reason) — the
-        // message isn't gone, so there's no reason its cached body
-        // should be either. Looked up *before* `queue_move`, which
-        // deletes the source row immediately.
+        // Purge both caches (if anything was cached) when the message
+        // is actually leaving the mailbox for good — Trash or Junk.
+        // Archive does NOT purge: on Gmail specifically, "archive" just
+        // removes the Inbox label (see `move_message_by_uid` in
+        // candor-gui, which already falls back to `\All` for exactly
+        // this reason) — the message isn't gone, so there's no reason
+        // either cache should be purged either. Looked up *before*
+        // `queue_move`, which deletes the source row immediately.
         if matches!(to_folder.as_str(), "\\Trash" | "\\Junk") {
             if let Ok(Some((message_id, _))) =
                 candor_core::store::message_id_for(&db, &acc.id, &from_folder, uid)
             {
                 let _ = candor_core::store::purge_message_body(&db, &acc.id, &message_id);
             }
+            let _ = candor_core::body::purge_cached_message(&acc.id, &from_folder, uid);
         }
 
         candor_core::store::queue_move(&db, &acc.id, &from_folder, uid, &to_folder)
@@ -419,7 +499,7 @@ impl DaemonService {
     /// `folder` empty means every folder.
     async fn search_server(&self, account_id: String, folder: String, query: String) -> zbus::fdo::Result<(bool, u32)> {
         let acc = resolve_account(&account_id)?;
-        let password = CredentialStore::get_password(&acc.id)
+        let password = oauth::resolve_credential(&acc)
             .map_err(|e| zbus::fdo::Error::Failed(format!("{e:#}")))?;
 
         let folder = (!folder.is_empty()).then_some(folder);
@@ -504,8 +584,9 @@ impl DaemonService {
 
     /// Parses a user-picked CSV export (Google/Nextcloud/Outlook/etc.)
     /// and upserts every row with a usable address — a one-time import,
-    /// not a live sync (see `candor_group6_contacts_plan` in memory for
-    /// why real CardDAV/Google Contacts integration was ruled out).
+    /// not a live sync: real CardDAV/contacts-service integration would
+    /// mean connecting to yet another account-specific service
+    /// directly, which this app otherwise deliberately never does.
     /// File I/O and parsing happen here, not in the GUI, same
     /// daemon-is-the-writer reasoning as everything else that touches
     /// the database. Returns `(true, imported_count)`, or `(false, 0)`
@@ -604,14 +685,13 @@ impl DaemonService {
     ///
     /// Refuses outright — before anything else, including the network
     /// round trip — if this account is locked. This is the real
-    /// enforcement point for the send lock (see `AccountConfig::locked`
-    /// and `candor_group7_multiaccount_plan` in memory): the GUI also
-    /// disables/unfocuses the Send control while locked, but "no way to
-    /// force it, period" means the block has to exist here too, not
-    /// just at the UI layer — the same defense-in-depth reasoning
-    /// behind `cache_opened_body`'s own Junk check above, after an
-    /// earlier audit found a related gap relying on only one layer's
-    /// enforcement.
+    /// enforcement point for the send lock (see `AccountConfig::locked`'s
+    /// own doc comment): the GUI also disables/unfocuses the Send
+    /// control while locked, but "no way to force it, period" means the
+    /// block has to exist here too, not just at the UI layer — the same
+    /// defense-in-depth reasoning behind `cache_opened_body`'s own Junk
+    /// check above, so a bypass of one layer alone was never enough to
+    /// defeat the lock.
     async fn send_message(
         &self,
         account_id: String,
@@ -630,7 +710,7 @@ impl DaemonService {
             )));
         }
 
-        let password = CredentialStore::get_password(&acc.id)
+        let password = oauth::resolve_credential(&acc)
             .map_err(|e| zbus::fdo::Error::Failed(format!("{e:#}")))?;
 
         let msg = candor_core::send::OutgoingMessage {
@@ -681,7 +761,7 @@ impl DaemonService {
             return Ok(false);
         };
 
-        let password = CredentialStore::get_password(&acc.id)
+        let password = oauth::resolve_credential(&acc)
             .map_err(|e| zbus::fdo::Error::Failed(format!("{e:#}")))?;
 
         let msg = candor_core::send::OutgoingMessage {
@@ -749,7 +829,8 @@ fn queue_flag_change(
 /// Junk just drops out of the queue without being cached — there's
 /// nothing wrong with that, it's the same "best effort, catches up
 /// eventually" spirit as the rest of this loop.
-async fn fill_pending_body_cache(account: &config::AccountConfig, password: &str) -> anyhow::Result<()> {
+async fn fill_pending_body_cache(account: &config::AccountConfig) -> anyhow::Result<()> {
+    let password = oauth::resolve_credential(account)?;
     let db = candor_core::store::open()?;
     let queued = candor_core::store::pending_body_cache(&db, &account.id)?;
     if queued.is_empty() {
@@ -774,7 +855,7 @@ async fn fill_pending_body_cache(account: &config::AccountConfig, password: &str
 
         match candor_core::body::fetch_body_text(
             account.clone(),
-            password.to_string(),
+            password.clone(),
             folder.clone(),
             uid,
         )
@@ -853,16 +934,12 @@ async fn main() -> anyhow::Result<()> {
     // just the first — background sync is independent per account
     // regardless of which one (if any) the GUI ends up focused on.
     for account in cfg.accounts {
-        match CredentialStore::get_password(&account.id) {
-            Ok(password) => {
-                let id = account.id.clone();
-                service.start_account(account, password);
-                tracing::info!(account = %id, "started account sync");
-            }
-            Err(e) => {
-                tracing::warn!(account = %account.id, error = %e, "could not read stored credential; sync not started")
-            }
+        let id = account.id.clone();
+        if let Err(e) = oauth::resolve_credential(&account) {
+            tracing::warn!(account = %id, error = %e, "could not read stored credential at startup; will retry in the background");
         }
+        service.start_account(account);
+        tracing::info!(account = %id, "started account sync");
     }
 
     let _conn = Builder::session()
